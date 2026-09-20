@@ -171,9 +171,23 @@ async fn watch(state: &Arc<AppState>, handle: &Arc<PipelineHandle>) {
             tokio::time::sleep(Duration::from_millis(250)).await;
             return;
         }
+        // CPAL reports a receiver/device failure asynchronously.  Reflect that
+        // in the status and restart so an unplugged wireless receiver is not
+        // presented as healthy until it can be opened again.
+        let capture_failed = handle
+            .inner
+            .lock()
+            .as_ref()
+            .and_then(|inner| inner._capturer.as_ref())
+            .is_some_and(|capturer| !capturer.is_healthy());
+        if capture_failed {
+            let mut status = state.status.write();
+            status.audio_active = false;
+            status.last_error = Some("audio input device disconnected; retrying".into());
+        }
         // Detect audio stream disconnect (e.g., paused live stream in OBS).
-        // When audio goes from active to inactive, we should restart the pipeline
-        // so it can reconnect when audio resumes.
+        // When audio goes from active to inactive, restart the pipeline so it
+        // can reconnect when audio resumes.
         let audio_active = state.status.read().audio_active;
         if last_audio_active && !audio_active {
             info!("audio stream disconnected, restarting pipeline to prepare for reconnection");

@@ -12,7 +12,10 @@
 //!              alsa-plugins bridge; we prefer it and fall back to the
 //!              default input (usually a microphone) with a warning.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -34,6 +37,7 @@ pub struct CaptureSpec {
 pub struct CaptureHandle {
     pub stream: Stream,
     pub spec: CaptureSpec,
+    healthy: Arc<AtomicBool>,
 }
 
 // SAFETY: cpal::Stream internally stores raw pointers and is therefore !Send
@@ -72,6 +76,16 @@ impl AudioCapturer {
         self.state.lock().is_some()
     }
 
+    /// CPAL reports device loss asynchronously through the stream error
+    /// callback.  Keep that signal available to the pipeline so it can stop
+    /// reporting an unplugged receiver as an active input and retry it.
+    pub fn is_healthy(&self) -> bool {
+        self.state
+            .lock()
+            .as_ref()
+            .is_some_and(|handle| handle.healthy.load(Ordering::Acquire))
+    }
+
     /// Start a new capture stream. The audio frames (downsampled to mono PCM
     /// s16le) are pushed into `tx`.
     pub fn start(&self, tx: PcmSender) -> Result<()> {
@@ -97,10 +111,11 @@ impl AudioCapturer {
         let output_rate = if self.cfg.sample_rate == 0 { 16_000 } else { self.cfg.sample_rate };
 
         let sample_format = supported.sample_format();
+        let healthy = Arc::new(AtomicBool::new(true));
         let stream = match sample_format {
-            SampleFormat::F32 => build_stream::<f32>(&device, &config, tx.clone(), output_rate),
-            SampleFormat::I16 => build_stream::<i16>(&device, &config, tx.clone(), output_rate),
-            SampleFormat::U16 => build_stream::<u16>(&device, &config, tx.clone(), output_rate),
+            SampleFormat::F32 => build_stream::<f32>(&device, &config, tx.clone(), output_rate, healthy.clone()),
+            SampleFormat::I16 => build_stream::<i16>(&device, &config, tx.clone(), output_rate, healthy.clone()),
+            SampleFormat::U16 => build_stream::<u16>(&device, &config, tx.clone(), output_rate, healthy.clone()),
             other => {
                 return Err(anyhow!(
                     "unsupported sample format {other:?}; please file an issue"
@@ -117,6 +132,7 @@ impl AudioCapturer {
                 sample_rate: output_rate,
                 channels: 1,
             },
+            healthy,
         });
 
         info!(
@@ -204,6 +220,7 @@ fn build_stream<T>(
     config: &StreamConfig,
     tx: PcmSender,
     output_rate: u32,
+    healthy: Arc<AtomicBool>,
 ) -> Result<Stream>
 where
     T: cpal::Sample + cpal::SizedSample + Send + 'static,
@@ -229,6 +246,7 @@ where
             let _ = err_tx.try_send(out);
         },
         move |err| {
+            healthy.store(false, Ordering::Release);
             tracing::error!(error = %err, "audio stream error");
         },
         None,
