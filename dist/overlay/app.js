@@ -110,10 +110,10 @@
     const r = Number(style.radius);
     root.setProperty("--caption-radius", (isFinite(r) && r >= 0 ? r : 8) + "px");
 
-    // 行数上限（1-4）。视口高度 = 行数 × 行高，超出的文字滚动显示。
+    // 直播字幕固定最多两行。长句由分页逻辑推进，不能靠增高区域塞第三行。
     let lines = Math.round(Number(style.maxLines));
     if (!isFinite(lines) || lines < 1) lines = 2;
-    if (lines > 4) lines = 4;
+    if (lines > 2) lines = 2;
     maxLines = lines;
     lineEl.classList.toggle("single-line", lines <= 1);
 

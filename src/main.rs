@@ -12,6 +12,7 @@ pub mod lang;
 pub mod llm;
 pub mod obs;
 pub mod pipeline;
+pub mod recording;
 pub mod server;
 pub mod subtitle;
 pub mod vad;
@@ -69,6 +70,7 @@ pub struct AppState {
     pub subtitle: Arc<subtitle::SubtitleHub>,
     pub pipeline: Arc<pipeline::PipelineHandle>,
     pub status: Arc<RwLock<AppStatus>>,
+    pub recording: recording::RecordingStore,
     pub obs_cmd_tx:
         parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<crate::obs::ObsCommand>>>,
     /// Audio mode forced via `--audio-mode` (the OBS plugin passes
@@ -176,9 +178,12 @@ async fn main() -> Result<()> {
         subtitle: subtitle.clone(),
         pipeline: pipeline.clone(),
         status: status.clone(),
+        recording: recording::RecordingStore::start(&cfg_path),
         obs_cmd_tx: parking_lot::Mutex::new(None),
         forced_audio_mode: cli.audio_mode.clone(),
     });
+
+    recording::spawn(state.recording.clone(), state.clone());
 
     pipeline::spawn(state.clone(), cfg_path.clone());
 

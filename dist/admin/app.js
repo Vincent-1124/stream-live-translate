@@ -268,7 +268,7 @@
       },
       overlay: {
         font_size: parseInt($("ov-size").value, 10) || 48,
-        max_lines: Math.min(4, Math.max(1, parseInt($("ov-max-lines").value, 10) || 2)),
+        max_lines: Math.min(2, Math.max(1, parseInt($("ov-max-lines").value, 10) || 2)),
         bg_width: Math.max(0, parseInt($("ov-bg-width").value, 10) || 0),
         bg_height: Math.max(0, parseInt($("ov-bg-height").value, 10) || 0),
         border_radius: Math.max(0, parseInt($("ov-border-radius").value, 10) || 0),

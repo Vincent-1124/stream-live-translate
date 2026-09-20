@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -60,6 +60,8 @@ fn build_router(state: Arc<AppState>, static_dir: PathBuf) -> Router {
         .route("/subtitles/clear", post(clear_subtitles))
         .route("/restart", post(restart_pipeline))
         .route("/locale", get(get_locale))
+        .route("/recordings", get(get_recording_info))
+        .route("/recordings/export", get(export_recording))
         .with_state(state.clone());
 
     // Disk directory for the optional bundled binaries (live-reload case).
@@ -353,6 +355,24 @@ fn ui_language() -> &'static str {
 
 async fn get_locale() -> Response {
     axum::Json(serde_json::json!({ "language": ui_language() })).into_response()
+}
+
+async fn get_recording_info(State(state): State<Arc<AppState>>) -> Response {
+    axum::Json(state.recording.info()).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct ExportQuery { format: Option<String> }
+
+async fn export_recording(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ExportQuery>,
+) -> Response {
+    match query.format.as_deref().unwrap_or("txt") {
+        "txt" => ([(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"))], state.recording.txt()).into_response(),
+        "srt" => ([(header::CONTENT_TYPE, HeaderValue::from_static("application/x-subrip; charset=utf-8"))], state.recording.srt()).into_response(),
+        _ => (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error":"format must be txt or srt"}))).into_response(),
+    }
 }
 
 #[derive(serde::Serialize)]
