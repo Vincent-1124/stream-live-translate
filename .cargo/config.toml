@@ -1,0 +1,7 @@
+# Project-local, TLS-verified mirror for constrained networks.  It affects
+# only this checkout and can be removed when crates.io is reachable directly.
+[source.crates-io]
+replace-with = "rsproxy"
+
+[source.rsproxy]
+registry = "sparse+https://rsproxy.cn/index/"
