@@ -16,10 +16,10 @@
 - 管理页可选择百炼 provider、填写模型与业务空间，并只显示 Key 是否已设置。
 - Final 结果始终覆盖当前 partial，包括较短的修订文本；对应单元测试已覆盖。
 - 每次运行创建独立 JSONL 最终字幕记录；管理 API 可导出当前会话的 TXT/SRT，并在音频或识别连接恢复时记录 Gap。写盘失败只告警，不停止直播。
+- 百炼协议解析已拆为可测试的事件处理：音频只在匹配的 `task-started` 后发送；启动/运行失败及旧任务的迟到事件可识别或忽略。离线单元测试覆盖 partial/final、失败和任务 ID 隔离。
 
 ## 仍待验证
 
 - 真实百炼调用、热词服务、OBS、无线麦克风和录播人工标注均未执行：没有使用或请求 API Key。
-- 真实百炼调用、热词服务、OBS、无线麦克风和录播人工标注均未执行：没有使用或请求 API Key。
-- 项目本地 `.cargo/config.toml` 使用 TLS 校验的 rsproxy 镜像；完整 `cargo test` 已通过 5 项单元测试，`cargo build --release` 已完成，候选引擎为 `target/release/stream-live-translate.exe`（3,522,560 bytes）。现有代码并未遵循 rustfmt，因此 `cargo fmt --check` 仍报告大量上游格式差异；未为通过检查而重排全仓。
+- 项目本地 `.cargo/config.toml` 使用 TLS 校验的 rsproxy 镜像；完整 `cargo test` 已通过 10 项单元测试，`cargo build --release` 已完成。OBS 打包脚本已改为使用项目内临时目录，规避含中文用户名路径的 MSVC 链接临时文件错误；但本机仍缺 OBS SDK 头文件，候选 OBS 包尚未生成。现有代码并未遵循 rustfmt，因此 `cargo fmt --check` 仍报告大量上游格式差异；未为通过检查而重排全仓。
 - 额度策略：每个工作单元前后及约每 10 分钟读取额度；五小时窗口剩余不高于 10% 时只保存进度，周窗口剩余不高于 35% 时停止自动开发并保留缓冲。已授权 heartbeat 在窗口重置后继续，不替代人工验收。
