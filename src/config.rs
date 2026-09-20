@@ -106,6 +106,10 @@ fn default_max_lines() -> u32 {
     2
 }
 
+fn default_display_delay_ms() -> u64 {
+    750
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConfig {
     /// `"system"` (loopback), `"device"` (input mic / specific output) or
@@ -188,6 +192,10 @@ pub struct OverlayConfig {
     /// single line, 2 = the default (grow only when the text needs it).
     #[serde(default = "default_max_lines")]
     pub max_lines: u32,
+    /// Small display buffer for a new caption page. It gives cumulative ASR
+    /// revisions time to settle without adding delay to an already-visible page.
+    #[serde(default = "default_display_delay_ms")]
+    pub display_delay_ms: u64,
     /// `bottom` / `top` / `middle`
     pub position: String,
     /// `single` / `double`
@@ -255,6 +263,7 @@ impl Default for Config {
                 border_radius: 8,
                 bg_opacity: 75,
                 max_lines: 2,
+                display_delay_ms: default_display_delay_ms(),
                 position: "bottom".into(),
                 layout: "single".into(),
                 animation: "typewriter".into(),
@@ -284,6 +293,7 @@ mod tests {
             "workspace_id = \"\"\r\n",
             "speech_noise_threshold = 0.0\r\n",
             "semantic_punctuation_enabled = true\r\n",
+            "display_delay_ms = 750\r\n",
         ] {
             raw = raw.replace(key, "");
         }
@@ -291,6 +301,7 @@ mod tests {
         assert!(cfg.llm.workspace_id.is_empty());
         assert_eq!(cfg.llm.speech_noise_threshold, 0.0);
         assert!(cfg.llm.semantic_punctuation_enabled);
+        assert_eq!(cfg.overlay.display_delay_ms, 750);
     }
 }
 

@@ -223,6 +223,7 @@
     // Overlay
     $("ov-size").value = cfg.overlay.font_size || 48;
     $("ov-max-lines").value = cfg.overlay.max_lines || 2;
+    $("ov-display-delay").value = cfg.overlay.display_delay_ms || 750;
     $("ov-bg-width").value = cfg.overlay.bg_width || 0;
     $("ov-bg-height").value = cfg.overlay.bg_height || 0;
     $("ov-border-radius").value = cfg.overlay.border_radius || 8;
@@ -272,6 +273,7 @@
       overlay: {
         font_size: parseInt($("ov-size").value, 10) || 48,
         max_lines: Math.min(2, Math.max(1, parseInt($("ov-max-lines").value, 10) || 2)),
+        display_delay_ms: Math.min(1000, Math.max(500, parseInt($("ov-display-delay").value, 10) || 750)),
         bg_width: Math.max(0, parseInt($("ov-bg-width").value, 10) || 0),
         bg_height: Math.max(0, parseInt($("ov-bg-height").value, 10) || 0),
         border_radius: Math.max(0, parseInt($("ov-border-radius").value, 10) || 0),

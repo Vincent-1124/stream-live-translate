@@ -19,6 +19,9 @@
   const textEl = lineEl;
   let currentText = "";
   let hideTimer = null;
+  let displayTimer = null;
+  let pendingText = null;
+  let displayDelayMs = 750;
   let partialBuffer = "";
   let lastPartialAt = 0;
   let ws = null;
@@ -340,6 +343,9 @@
     if (ov.bg_height !== undefined) style.height = Number(ov.bg_height) || 0;
     if (ov.border_radius !== undefined) style.radius = Number(ov.border_radius) || 0;
     if (ov.max_lines !== undefined) style.maxLines = Number(ov.max_lines) || 2;
+    if (ov.display_delay_ms !== undefined) {
+      displayDelayMs = Math.min(1000, Math.max(500, Number(ov.display_delay_ms) || 750));
+    }
     renderStyle();
     setBodyVariant("position", ov.position);
     setBodyVariant("animation", ov.animation);
@@ -381,7 +387,7 @@
       .trim();
   }
 
-  function show(text) {
+  function renderShow(text) {
     if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
     const line = toSingleLine(text);
     currentText = line;
@@ -391,7 +397,28 @@
     renderCaption(line.length > 1000 ? line.slice(0, 1000) + "…" : line);
   }
 
+  function show(text) {
+    // Buffer only the first render of a page. Later partials replace the
+    // queued text without resetting its deadline, so a fast stream cannot
+    // postpone the page indefinitely and visible text stays live.
+    if (!currentText && displayDelayMs > 0) {
+      pendingText = text;
+      if (!displayTimer) {
+        displayTimer = setTimeout(() => {
+          displayTimer = null;
+          const queued = pendingText;
+          pendingText = null;
+          if (queued !== null) renderShow(queued);
+        }, displayDelayMs);
+      }
+      return;
+    }
+    renderShow(text);
+  }
+
   function hide() {
+    if (displayTimer) { clearTimeout(displayTimer); displayTimer = null; }
+    pendingText = null;
     captionEl.classList.add("empty");
     captionEl.classList.remove("show");
     pageStart = 0;
