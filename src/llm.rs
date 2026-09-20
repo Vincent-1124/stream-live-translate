@@ -975,6 +975,75 @@ pub mod bailian {
 
     const PUBLIC_BEIJING_ENDPOINT: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum StartEvent {
+        Started,
+        Failed(String),
+        Ignore,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum ResultEvent {
+        Partial(String),
+        Final(String),
+        Failed(String),
+        Finished,
+        Ignore,
+    }
+
+    fn event_error(value: &serde_json::Value) -> String {
+        value
+            .pointer("/header/error_message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误")
+            .to_string()
+    }
+
+    fn parse_start_event(text: &str, task_id: &str) -> StartEvent {
+        let value: serde_json::Value = match serde_json::from_str(text) {
+            Ok(value) => value,
+            Err(_) => return StartEvent::Ignore,
+        };
+        if value.pointer("/header/task_id").and_then(|v| v.as_str()) != Some(task_id) {
+            return StartEvent::Ignore;
+        }
+        match value.pointer("/header/event").and_then(|v| v.as_str()) {
+            Some("task-started") => StartEvent::Started,
+            Some("task-failed") => StartEvent::Failed(event_error(&value)),
+            _ => StartEvent::Ignore,
+        }
+    }
+
+    fn parse_result_event(text: &str, task_id: &str) -> ResultEvent {
+        let value: serde_json::Value = match serde_json::from_str(text) {
+            Ok(value) => value,
+            Err(_) => return ResultEvent::Ignore,
+        };
+        if value.pointer("/header/task_id").and_then(|v| v.as_str()) != Some(task_id) {
+            return ResultEvent::Ignore;
+        }
+        match value.pointer("/header/event").and_then(|v| v.as_str()) {
+            Some("result-generated") => {
+                let sentence = &value["payload"]["output"]["sentence"];
+                if sentence.get("heartbeat").and_then(|v| v.as_bool()) == Some(true) {
+                    return ResultEvent::Ignore;
+                }
+                let text = sentence.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if text.is_empty() {
+                    return ResultEvent::Ignore;
+                }
+                if sentence.get("sentence_end").and_then(|v| v.as_bool()) == Some(true) {
+                    ResultEvent::Final(text.to_string())
+                } else {
+                    ResultEvent::Partial(text.to_string())
+                }
+            }
+            Some("task-failed") => ResultEvent::Failed(event_error(&value)),
+            Some("task-finished") => ResultEvent::Finished,
+            _ => ResultEvent::Ignore,
+        }
+    }
+
     pub struct BailianFunAsr { cfg: LlmConfig, endpoint: String }
 
     impl BailianFunAsr {
@@ -1017,11 +1086,10 @@ pub mod bailian {
             while let Some(message) = read.next().await {
                 let message = message.context("读取百炼启动事件")?;
                 if let Message::Text(text) = message {
-                    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-                    match value.pointer("/header/event").and_then(|v| v.as_str()) {
-                        Some("task-started") => { started = true; break; }
-                        Some("task-failed") => return Err(anyhow!("百炼启动失败：{}", value.pointer("/header/error_message").and_then(|v| v.as_str()).unwrap_or("未知错误"))),
-                        _ => {}
+                    match parse_start_event(&text, &task_id) {
+                        StartEvent::Started => { started = true; break; }
+                        StartEvent::Failed(error) => return Err(anyhow!("百炼启动失败：{error}")),
+                        StartEvent::Ignore => {}
                     }
                 }
             }
@@ -1032,20 +1100,12 @@ pub mod bailian {
             let reader = async move {
                 while let Some(message) = read.next().await {
                     let Message::Text(text) = message? else { continue };
-                    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-                    if value.pointer("/header/task_id").and_then(|v| v.as_str()) != Some(task_for_read.as_str()) { continue; }
-                    match value.pointer("/header/event").and_then(|v| v.as_str()) {
-                        Some("result-generated") => {
-                            let sentence = &value["payload"]["output"]["sentence"];
-                            if sentence.get("heartbeat").and_then(|v| v.as_bool()) == Some(true) { continue; }
-                            let text = sentence.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
-                            if text.is_empty() { continue; }
-                            if sentence.get("sentence_end").and_then(|v| v.as_bool()) == Some(true) { sink_read.push(SubtitleEvent::Final(text.to_string())); }
-                            else { sink_read.push(SubtitleEvent::Replace(text.to_string())); }
-                        }
-                        Some("task-failed") => return Err(anyhow!("百炼任务失败：{}", value.pointer("/header/error_message").and_then(|v| v.as_str()).unwrap_or("未知错误"))),
-                        Some("task-finished") => return Ok(()),
-                        _ => {}
+                    match parse_result_event(&text, &task_for_read) {
+                        ResultEvent::Partial(text) => sink_read.push(SubtitleEvent::Replace(text)),
+                        ResultEvent::Final(text) => sink_read.push(SubtitleEvent::Final(text)),
+                        ResultEvent::Failed(error) => return Err(anyhow!("百炼任务失败：{error}")),
+                        ResultEvent::Finished => return Ok(()),
+                        ResultEvent::Ignore => {}
                     }
                 }
                 Ok(())
@@ -1061,6 +1121,67 @@ pub mod bailian {
                 Ok(())
             };
             tokio::select! { result = reader => result, result = writer => result }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{parse_result_event, parse_start_event, ResultEvent, StartEvent};
+
+        fn event(task_id: &str, event: &str) -> String {
+            serde_json::json!({"header": {"task_id": task_id, "event": event}}).to_string()
+        }
+
+        #[test]
+        fn audio_is_gated_until_task_started() {
+            let sequence = [
+                event("task-1", "task-starting"),
+                event("task-1", "task-started"),
+            ];
+            let mut started = false;
+            let mut audio_sent = Vec::new();
+            for message in sequence {
+                if matches!(parse_start_event(&message, "task-1"), StartEvent::Started) {
+                    started = true;
+                }
+                if started {
+                    audio_sent.push("pcm");
+                }
+            }
+            assert_eq!(audio_sent, vec!["pcm"]);
+        }
+
+        #[test]
+        fn parses_partial_and_final_results() {
+            let partial = serde_json::json!({
+                "header": {"task_id": "task-1", "event": "result-generated"},
+                "payload": {"output": {"sentence": {"text": "你好", "sentence_end": false}}}
+            }).to_string();
+            let final_text = serde_json::json!({
+                "header": {"task_id": "task-1", "event": "result-generated"},
+                "payload": {"output": {"sentence": {"text": "你好世界", "sentence_end": true}}}
+            }).to_string();
+            assert_eq!(parse_result_event(&partial, "task-1"), ResultEvent::Partial("你好".into()));
+            assert_eq!(parse_result_event(&final_text, "task-1"), ResultEvent::Final("你好世界".into()));
+        }
+
+        #[test]
+        fn recognizes_task_failures() {
+            let failed = serde_json::json!({
+                "header": {"task_id": "task-1", "event": "task-failed", "error_message": "quota exceeded"}
+            }).to_string();
+            assert_eq!(parse_start_event(&failed, "task-1"), StartEvent::Failed("quota exceeded".into()));
+            assert_eq!(parse_result_event(&failed, "task-1"), ResultEvent::Failed("quota exceeded".into()));
+        }
+
+        #[test]
+        fn ignores_duplicate_or_late_task_ids() {
+            let result = serde_json::json!({
+                "header": {"task_id": "old-task", "event": "result-generated"},
+                "payload": {"output": {"sentence": {"text": "旧结果", "sentence_end": true}}}
+            }).to_string();
+            assert_eq!(parse_result_event(&result, "current-task"), ResultEvent::Ignore);
+            assert_eq!(parse_start_event(&result, "current-task"), StartEvent::Ignore);
         }
     }
 }
