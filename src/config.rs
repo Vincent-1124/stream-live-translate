@@ -264,6 +264,36 @@ impl Default for Config {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn new_configs_default_to_bailian_realtime() {
+        let cfg = Config::default();
+        assert_eq!(cfg.llm.provider, "bailian-fun-asr");
+        assert_eq!(cfg.llm.model, "fun-asr-realtime");
+        assert_eq!(cfg.llm.target_lang, "zh");
+        assert!(!cfg.llm.translate_chinese);
+    }
+
+    #[test]
+    fn older_configs_can_omit_new_bailian_fields() {
+        let mut raw = toml::to_string(&Config::default()).expect("serialize config");
+        for key in [
+            "workspace_id = \"\"\r\n",
+            "speech_noise_threshold = 0.0\r\n",
+            "semantic_punctuation_enabled = true\r\n",
+        ] {
+            raw = raw.replace(key, "");
+        }
+        let cfg: Config = toml::from_str(&raw).expect("read older config");
+        assert!(cfg.llm.workspace_id.is_empty());
+        assert_eq!(cfg.llm.speech_noise_threshold, 0.0);
+        assert!(cfg.llm.semantic_punctuation_enabled);
+    }
+}
+
 impl Config {
     pub fn load_or_create(path: &Path) -> Result<Self> {
         if path.exists() {
