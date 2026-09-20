@@ -25,6 +25,13 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 
+# MSVC's linker can inherit a non-Unicode-compatible user Temp path.  Keep
+# its response files under the build directory for this packaging run.
+$linkTemp = Join-Path $root "build\tmp"
+New-Item -ItemType Directory -Force -Path $linkTemp | Out-Null
+$env:TEMP = $linkTemp
+$env:TMP = $linkTemp
+
 # A relative WorkDir must be anchored at the repo root: CMake resolves a
 # relative LIBOBS_INCLUDE_DIR against the plugin source directory, not our
 # working directory, which would make obs-module.h unfindable.
