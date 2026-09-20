@@ -419,6 +419,9 @@
   function hide() {
     if (displayTimer) { clearTimeout(displayTimer); displayTimer = null; }
     pendingText = null;
+    // A completed silence period starts a new page. Keeping stale text here
+    // would bypass the next page's display buffer and let resize re-render it.
+    currentText = "";
     captionEl.classList.add("empty");
     captionEl.classList.remove("show");
     pageStart = 0;
