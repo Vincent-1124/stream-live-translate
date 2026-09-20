@@ -846,6 +846,20 @@
       }
     });
 
+    $("clear-key-btn").addEventListener("click", async () => {
+      const btn = $("clear-key-btn");
+      btn.disabled = true;
+      try {
+        await apiPost("/api/config/clear-key");
+        await loadConfig();
+        toast("已清除保存的 API Key", "ok");
+      } catch (e) {
+        toast("清除 Key 失败：" + (e.message || e), "error");
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
     $("connection-test-btn").addEventListener("click", async () => {
       const btn = $("connection-test-btn");
       const status = $("save-status");

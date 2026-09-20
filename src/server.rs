@@ -54,6 +54,7 @@ fn build_router(state: Arc<AppState>, static_dir: PathBuf) -> Router {
     // must NOT repeat the /api prefix.
     let api = Router::new()
         .route("/config", get(get_config).post(post_config))
+        .route("/config/clear-key", post(clear_api_key))
         .route("/devices", get(get_devices))
         .route("/status", get(get_status))
         .route("/audio-test", post(run_audio_test))
@@ -304,6 +305,26 @@ async fn post_config(
         axum::Json(serde_json::json!({"ok": true})),
     )
         .into_response()
+}
+
+async fn clear_api_key(State(state): State<Arc<AppState>>) -> Response {
+    let mut cfg = state.config.read().clone();
+    cfg.llm.api_key.clear();
+    if let Err(error) = cfg.save(&crate::config_path()) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(serde_json::json!({"error": format!("清除 Key 写入失败：{error}")}))).into_response();
+    }
+    let verified = std::fs::read_to_string(crate::config_path())
+        .ok()
+        .and_then(|raw| toml::from_str::<crate::config::Config>(&raw).ok())
+        .map(|disk| disk.llm.api_key.is_empty())
+        .unwrap_or(false);
+    if !verified {
+        return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(serde_json::json!({"error":"清除 Key 后磁盘校验失败"}))).into_response();
+    }
+    *state.config.write() = cfg;
+    let _ = state.config_tx.send(());
+    state.pipeline.restart().await;
+    axum::Json(serde_json::json!({"ok": true})).into_response()
 }
 
 fn merge_json(cfg: &mut Config, patch: &serde_json::Value) -> anyhow::Result<()> {
