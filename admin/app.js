@@ -846,6 +846,29 @@
       }
     });
 
+    $("connection-test-btn").addEventListener("click", async () => {
+      const btn = $("connection-test-btn");
+      const status = $("save-status");
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "测试中…";
+      status.textContent = "正在验证已保存的 Key、模型与业务空间…";
+      status.className = "status";
+      try {
+        const result = await apiPost("/api/connection-test");
+        status.textContent = "✓ " + (result.message || "连接可用");
+        status.className = "status ok";
+        toast("连接测试通过", "ok");
+      } catch (e) {
+        status.textContent = "✗ " + (e.message || e);
+        status.className = "status err";
+        toast("连接测试失败：" + (e.message || e), "error");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    });
+
     $("restart-btn").addEventListener("click", async () => {
       const btn = $("restart-btn");
       btn.disabled = true;

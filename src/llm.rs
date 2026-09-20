@@ -53,6 +53,17 @@ pub fn build(cfg: &LlmConfig) -> Result<Arc<dyn LlmProvider>> {
     }
 }
 
+/// Validate a configured service without starting the live audio pipeline.
+/// The Bailian probe starts and finishes an empty task so it checks both the
+/// saved credentials and the selected model.
+pub async fn test_connection(cfg: &LlmConfig) -> Result<()> {
+    match cfg.provider.as_str() {
+        "bailian-fun-asr" => bailian::test_connection(cfg.clone()).await,
+        "mock" => Ok(()),
+        other => Err(anyhow!("provider `{other}` does not support a connection test yet")),
+    }
+}
+
 /// Unwrap a realtime WebSocket handshake failure into a human-readable
 /// error. DashScope/OpenAI answer failed upgrades with an HTTP status +
 /// JSON body (invalid key, unknown model, workspace endpoint required…);
@@ -1056,6 +1067,54 @@ pub mod bailian {
             if !endpoint.starts_with("wss://") { return Err(anyhow!("百炼 Fun-ASR 端点必须使用 wss://")); }
             Ok(Self { cfg, endpoint })
         }
+    }
+
+    pub async fn test_connection(cfg: LlmConfig) -> Result<()> {
+        let provider = BailianFunAsr::new(cfg)?;
+        let mut request = provider.endpoint.into_client_request().context("构造百炼 WebSocket 请求")?;
+        request.headers_mut().insert(http::header::AUTHORIZATION, http::HeaderValue::from_str(&format!("Bearer {}", provider.cfg.api_key)).context("API Key 不能用于 HTTP 请求头")?);
+        if !provider.cfg.workspace_id.trim().is_empty() {
+            request.headers_mut().insert(http::HeaderName::from_static("x-dashscope-workspace"), http::HeaderValue::from_str(&provider.cfg.workspace_id).context("业务空间 ID 不能用于 HTTP 请求头")?);
+        }
+        let (ws, _) = tokio_tungstenite::connect_async(request).await.map_err(|e| ws_connect_error(e, "连接百炼 Fun-ASR"))?;
+        let (mut write, mut read) = ws.split();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let start = serde_json::json!({
+            "header": { "action": "run-task", "task_id": task_id, "streaming": "duplex" },
+            "payload": { "task_group": "audio", "task": "asr", "function": "recognition", "model": provider.cfg.model,
+                "parameters": { "format": "pcm", "sample_rate": 16000, "semantic_punctuation_enabled": provider.cfg.semantic_punctuation_enabled, "speech_noise_threshold": provider.cfg.speech_noise_threshold, "heartbeat": true }, "input": {} }
+        });
+        write.send(Message::Text(start.to_string().into())).await.context("启动百炼识别测试")?;
+        let started = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            while let Some(message) = read.next().await {
+                let message = message.context("读取百炼启动事件")?;
+                if let Message::Text(text) = message {
+                    match parse_start_event(&text, &task_id) {
+                        StartEvent::Started => return Ok(true),
+                        StartEvent::Failed(error) => return Err(anyhow!("百炼启动失败：{error}")),
+                        StartEvent::Ignore => {}
+                    }
+                }
+            }
+            Ok(false)
+        }).await.context("等待百炼任务启动超时")??;
+        if !started { return Err(anyhow!("百炼连接在任务启动前关闭")); }
+        let finish = serde_json::json!({ "header": { "action": "finish-task", "task_id": task_id, "streaming": "duplex" }, "payload": { "input": {} } });
+        write.send(Message::Text(finish.to_string().into())).await.context("结束百炼识别测试")?;
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            while let Some(message) = read.next().await {
+                let message = message.context("读取百炼结束事件")?;
+                if let Message::Text(text) = message {
+                    match parse_result_event(&text, &task_id) {
+                        ResultEvent::Finished => return Ok(()),
+                        ResultEvent::Failed(error) => return Err(anyhow!("百炼任务失败：{error}")),
+                        _ => {}
+                    }
+                }
+            }
+            Err(anyhow!("百炼任务结束前连接关闭"))
+        }).await.context("等待百炼任务结束超时")??;
+        Ok(())
     }
 
     #[async_trait]

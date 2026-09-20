@@ -56,6 +56,7 @@ fn build_router(state: Arc<AppState>, static_dir: PathBuf) -> Router {
         .route("/config", get(get_config).post(post_config))
         .route("/devices", get(get_devices))
         .route("/status", get(get_status))
+        .route("/connection-test", post(test_connection))
         .route("/subtitles", get(get_subtitles))
         .route("/subtitles/clear", post(clear_subtitles))
         .route("/restart", post(restart_pipeline))
@@ -419,6 +420,21 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Response {
         audio_mode_forced: state.forced_audio_mode.clone(),
     };
     axum::Json(view).into_response()
+}
+
+async fn test_connection(State(state): State<Arc<AppState>>) -> Response {
+    let cfg = state.config.read().llm.clone();
+    match tokio::time::timeout(std::time::Duration::from_secs(20), crate::llm::test_connection(&cfg)).await {
+        Ok(Ok(())) => axum::Json(serde_json::json!({"ok": true, "message": "已验证鉴权、任务启动和正常结束"})).into_response(),
+        Ok(Err(error)) => (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": format!("连接测试失败：{error:#}")})),
+        ).into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            axum::Json(serde_json::json!({"error": "连接测试超时，请检查网络、地域和业务空间"})),
+        ).into_response(),
+    }
 }
 
 #[derive(serde::Serialize)]
