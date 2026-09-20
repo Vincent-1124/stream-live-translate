@@ -95,8 +95,9 @@ async fn run(
     handle: Arc<PipelineHandle>,
 ) {
     let mut backoff = Duration::from_secs(2);
+    let mut shutdown_rx = handle.shutdown_rx.clone();
     loop {
-        if *handle.shutdown_rx.borrow() {
+        if *shutdown_rx.borrow() {
             return;
         }
         let result = try_start(&state, &handle).await;
@@ -118,7 +119,14 @@ async fn run(
                     s.audio_active = false;
                     s.llm_connected = false;
                 }
-                tokio::time::sleep(backoff).await;
+                // A stop must not wait for the current retry delay.  This
+                // also prevents a shutdown from issuing one final reconnect.
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() { return; }
+                    }
+                }
                 backoff = (backoff * 2).min(Duration::from_secs(10));
                 continue;
             }
