@@ -607,6 +607,15 @@
     }
   }
 
+  async function loadRecordingInfo() {
+    try {
+      const info = await apiGet("/api/recordings");
+      $("recording-path").textContent = "本场记录：" + (info.jsonl_path || "不可用");
+    } catch (e) {
+      $("recording-path").textContent = "本场记录路径不可用：" + (e.message || e);
+    }
+  }
+
   async function loadStatus() {
     try {
       const s = await apiGet("/api/status");
@@ -947,6 +956,7 @@
       setupFileImport();
       await loadConfig();
       await loadDevices();
+      await loadRecordingInfo();
       loadStatus();
       loadHistory();
       connectWS();

@@ -279,9 +279,12 @@
           <span>📂 导入字幕文件</span>
           <input id="import-file" type="file" accept=".srt,.vtt,.txt,.json,text/plain" hidden />
         </label>
+        <a class="btn ghost" href="/api/recordings/export?format=txt" download="live-subtitles.txt">导出本场 TXT</a>
+        <a class="btn ghost" href="/api/recordings/export?format=srt" download="live-subtitles.srt">导出本场 SRT</a>
         <button id="clear-history-btn" class="btn ghost" type="button">清空历史</button>
         <span class="hint" id="import-hint">支持 SRT / VTT / TXT / JSON（把字幕加到下方历史区，不写入服务器）</span>
       </div>
+      <p id="recording-path" class="hint">本场记录：读取中…</p>
       <div id="history" class="history">
         <div class="empty-tip">暂无字幕历史。说一句话、或导入一个 SRT/VTT 试试。</div>
       </div>
