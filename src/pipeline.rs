@@ -244,6 +244,9 @@ async fn try_start(state: &Arc<AppState>, handle: &Arc<PipelineHandle>) -> Resul
                 .sample_rate
                 .max(16_000);
             let decision = vad.decide(&frame, spec_rate);
+            // Expose the selected capture source before VAD filtering for
+            // microphone selection and quiet-speech calibration.
+            vad_state.status.write().input_level = decision.rms;
             match decision.kind {
                 SegmentKind::Speech => {
                     let _ = speech_tx.try_send(frame.clone());

@@ -379,6 +379,7 @@ async fn export_recording(
 struct StatusView {
     running: bool,
     audio_active: bool,
+    input_level: f32,
     llm_connected: bool,
     obs_connected: bool,
     last_error: Option<String>,
@@ -402,6 +403,7 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Response {
     let view = StatusView {
         running: state.pipeline.is_running(),
         audio_active: s.audio_active,
+        input_level: s.input_level,
         llm_connected: s.llm_connected,
         obs_connected: s.obs_connected,
         last_error: s.last_error,

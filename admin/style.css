@@ -174,6 +174,11 @@ code {
 .field-status.set { color: var(--ok); }
 .field-status.unset { color: var(--warn); }
 
+.input-meter { display: grid; grid-template-columns: 88px 1fr auto; align-items: center; gap: 10px; margin: 10px 0; }
+.meter-track { height: 8px; overflow: hidden; border-radius: 999px; background: #e5e7eb; }
+.meter-track i { display: block; width: 0; height: 100%; background: #22a06b; transition: width .15s ease; }
+.input-meter b { min-width: 68px; color: #52606d; font-size: 12px; text-align: right; }
+
 .card input[type=text],
 .card input[type=number],
 .card input[type=password],

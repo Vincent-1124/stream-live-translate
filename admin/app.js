@@ -614,6 +614,12 @@
         el.classList.add(ok ? "ok" : warn ? "warn" : "bad");
       };
       set("dot-audio", !!s.audio_active, false);
+      const level = Math.max(0, Math.min(1, Number(s.input_level) || 0));
+      const percent = Math.round(Math.sqrt(level) * 100);
+      const meter = $("input-level-bar");
+      meter.style.width = percent + "%";
+      meter.parentElement.setAttribute("aria-valuenow", String(percent));
+      $("input-level-text").textContent = percent < 2 ? "未检测到声音" : `${percent}%`;
       set("dot-llm", !!s.llm_connected, s.running && !s.last_error ? true : false);
       set("dot-obs", !!s.obs_connected, false);
       const run = $("run-state");
