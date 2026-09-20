@@ -78,15 +78,11 @@ impl SubtitleSink {
                 let mut s = self.state.lock();
                 let now = chrono::Utc::now().timestamp_millis();
                 if let Some(cur) = s.current.as_mut() {
-                    // Final supersedes the partial buffer; we *append* the
-                    // model's correction rather than replacing so the user
-                    // sees the union of the streamed fragments.
+                    // A final result is authoritative.  It may be shorter
+                    // than a partial after punctuation or a decoding revision,
+                    // so length is not a safe proxy for correctness.
                     if !text.is_empty() {
-                        if cur.text.is_empty() {
-                            cur.text = text.clone();
-                        } else if text.len() > cur.text.len() {
-                            cur.text = text.clone();
-                        }
+                        cur.text = text.clone();
                     }
                     cur.finalised = true;
                     cur.updated_at_ms = now;
@@ -224,5 +220,16 @@ mod tests {
         assert_eq!(r, serde_json::json!({"type":"partial", "text":"fixed", "replace":true}));
         let c = ws_payload(&SubtitleEvent::Cleared);
         assert_eq!(c, serde_json::json!({"type": "cleared"}));
+    }
+
+    #[test]
+    fn final_can_shorten_a_partial_revision() {
+        let hub = SubtitleHub::default();
+        let sink = hub.sink();
+        sink.push(SubtitleEvent::Replace("这是一段需要修正的错误字幕".into()));
+        sink.push(SubtitleEvent::Final("这是一段字幕".into()));
+        let history = hub.history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].text, "这是一段字幕");
     }
 }

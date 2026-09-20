@@ -13,10 +13,12 @@
 - 按百炼 WebSocket 协议实现 Bearer 鉴权、`run-task`、等待 `task-started`、16k 单声道 PCM 二进制帧、`finish-task`，并解析 `result-generated`、`task-failed`、`task-finished`。
 - 中间结果采用替换语义，避免累计修订重复追加为字幕；overlay 已识别替换事件。
 - `/api/config` 不再返回 API Key；常规空白保存保留已有 Key。
+- 管理页可选择百炼 provider、填写模型与业务空间，并只显示 Key 是否已设置。
+- Final 结果始终覆盖当前 partial，包括较短的修订文本；对应单元测试已覆盖。
 
 ## 仍待验证
 
 - 真实百炼调用、热词服务、OBS、无线麦克风和录播人工标注均未执行：没有使用或请求 API Key。
 - 真实百炼调用、热词服务、OBS、无线麦克风和录播人工标注均未执行：没有使用或请求 API Key。
-- 项目本地 `.cargo/config.toml` 使用 TLS 校验的 rsproxy 镜像；`cargo test` 已通过 4 项现有单元测试。格式与发布构建仍在执行，不能据此宣称正式验收通过。
+- 项目本地 `.cargo/config.toml` 使用 TLS 校验的 rsproxy 镜像；完整 `cargo test` 已通过 5 项单元测试，`cargo build --release` 已完成，候选引擎为 `target/release/stream-live-translate.exe`（3,522,560 bytes）。现有代码并未遵循 rustfmt，因此 `cargo fmt --check` 仍报告大量上游格式差异；未为通过检查而重排全仓。
 - 额度策略：每个工作单元前后及约每 10 分钟读取额度；五小时窗口剩余不高于 10% 时只保存进度，周窗口剩余不高于 35% 时停止自动开发并保留缓冲。已授权 heartbeat 在窗口重置后继续，不替代人工验收。
