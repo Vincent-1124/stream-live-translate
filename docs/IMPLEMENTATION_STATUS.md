@@ -13,6 +13,7 @@
 - 按百炼 WebSocket 协议实现 Bearer 鉴权、`run-task`、等待 `task-started`、16k 单声道 PCM 二进制帧、`finish-task`，并解析 `result-generated`、`task-failed`、`task-finished`。
 - 中间结果采用替换语义，避免累计修订重复追加为字幕；overlay 已识别替换事件。
 - `/api/config` 不再返回 API Key；常规空白保存保留已有 Key。
+- 管理页提供明确的“清除已保存 Key”操作；写盘后读回校验成功才更新内存配置并重启管线。
 - 管理页可选择百炼 provider、填写模型与业务空间，并只显示 Key 是否已设置。
 - Final 结果始终覆盖当前 partial，包括较短的修订文本；对应单元测试已覆盖。
 - 每次运行创建独立 JSONL 最终字幕记录；管理 API 可导出当前会话的 TXT/SRT，并在音频或识别连接恢复时记录 Gap。写盘失败只告警，不停止直播。
