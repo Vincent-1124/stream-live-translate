@@ -86,6 +86,10 @@ pub struct AppStatus {
     /// RMS of the most recent captured frame (0.0–1.0). Measured before VAD
     /// so the panel can show quiet speech even when a filter suppresses it.
     pub input_level: f32,
+    /// Rolling capture counters reset only by the explicit microphone test.
+    pub input_frames: u64,
+    pub input_rms_sum: f64,
+    pub input_peak: f32,
     pub llm_connected: bool,
     pub obs_connected: bool,
     pub last_error: Option<String>,

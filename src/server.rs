@@ -56,6 +56,7 @@ fn build_router(state: Arc<AppState>, static_dir: PathBuf) -> Router {
         .route("/config", get(get_config).post(post_config))
         .route("/devices", get(get_devices))
         .route("/status", get(get_status))
+        .route("/audio-test", post(run_audio_test))
         .route("/connection-test", post(test_connection))
         .route("/subtitles", get(get_subtitles))
         .route("/subtitles/clear", post(clear_subtitles))
@@ -435,6 +436,57 @@ async fn test_connection(State(state): State<Arc<AppState>>) -> Response {
             axum::Json(serde_json::json!({"error": "连接测试超时，请检查网络、地域和业务空间"})),
         ).into_response(),
     }
+}
+
+#[derive(Clone, Copy)]
+struct MeterSnapshot {
+    frames: u64,
+    rms_sum: f64,
+    peak: f32,
+}
+
+fn meter_snapshot(state: &AppState) -> MeterSnapshot {
+    let status = state.status.read();
+    MeterSnapshot { frames: status.input_frames, rms_sum: status.input_rms_sum, peak: status.input_peak }
+}
+
+async fn run_audio_test(State(state): State<Arc<AppState>>) -> Response {
+    if !state.status.read().audio_active {
+        return (StatusCode::CONFLICT, axum::Json(serde_json::json!({"error": "音频输入未运行，请先保存配置并确认管线启动"}))).into_response();
+    }
+    {
+        let mut status = state.status.write();
+        status.input_frames = 0;
+        status.input_rms_sum = 0.0;
+        status.input_peak = 0.0;
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let quiet = meter_snapshot(&state);
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    let spoken = meter_snapshot(&state);
+    let quiet_avg = if quiet.frames == 0 { 0.0 } else { quiet.rms_sum / quiet.frames as f64 };
+    let speech_frames = spoken.frames.saturating_sub(quiet.frames);
+    let speech_sum = (spoken.rms_sum - quiet.rms_sum).max(0.0);
+    let speech_avg = if speech_frames == 0 { 0.0 } else { speech_sum / speech_frames as f64 };
+    if spoken.frames == 0 || speech_frames == 0 {
+        return (StatusCode::CONFLICT, axum::Json(serde_json::json!({"error": "未收到音频，请检查所选麦克风或 OBS 音源"}))).into_response();
+    }
+    let advice = if speech_avg < 0.005 {
+        "讲话音量过低：靠近麦克风或提高输入增益后重试"
+    } else if spoken.peak > 0.98 {
+        "检测到可能削波：降低输入增益后重试"
+    } else if speech_avg < quiet_avg * 1.5 {
+        "讲话与背景差异较小：确认选中了无线麦克风，再比较“保留轻声”和“平衡”预设"
+    } else {
+        "输入信号可用；请结合实际字幕再选择过滤预设"
+    };
+    axum::Json(serde_json::json!({
+        "ok": true,
+        "quiet_rms": quiet_avg,
+        "speech_rms": speech_avg,
+        "peak": spoken.peak,
+        "message": advice,
+    })).into_response()
 }
 
 #[derive(serde::Serialize)]

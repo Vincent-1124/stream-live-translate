@@ -869,6 +869,27 @@
       }
     });
 
+    $("audio-test-btn").addEventListener("click", async () => {
+      const btn = $("audio-test-btn");
+      const status = $("save-status");
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "试音中…";
+      status.textContent = "请先保持安静 3 秒，然后正常讲话并包含轻声…";
+      status.className = "status";
+      try {
+        const result = await apiPost("/api/audio-test");
+        status.textContent = "✓ " + result.message;
+        status.className = "status ok";
+      } catch (e) {
+        status.textContent = "✗ " + (e.message || e);
+        status.className = "status err";
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    });
+
     $("restart-btn").addEventListener("click", async () => {
       const btn = $("restart-btn");
       btn.disabled = true;
