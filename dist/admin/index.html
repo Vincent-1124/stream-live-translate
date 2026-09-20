@@ -128,6 +128,15 @@
         <span>设备</span>
         <select id="audio-device"></select>
       </label>
+      <label>
+        <span>人声过滤预设</span>
+        <select id="filter-preset">
+          <option value="soft">保留轻声</option>
+          <option value="balanced" selected>平衡</option>
+          <option value="strong">强过滤</option>
+        </select>
+        <small class="field-status">预设是起点；请用实际无线麦克风试音后再确认。</small>
+      </label>
       <label class="row">
         <input id="use_sck" type="checkbox" />
         <span>macOS 使用 ScreenCaptureKit（需要授予"屏幕录制"权限）</span>

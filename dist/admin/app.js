@@ -211,6 +211,8 @@
     }
     modeSel.value = cfg.audio.mode;
     $("use_sck").checked = !!cfg.audio.use_screen_capture_kit;
+    const rms = Number(cfg.filter && cfg.filter.silence_rms);
+    $("filter-preset").value = rms <= 0.008 ? "soft" : rms >= 0.018 ? "strong" : "balanced";
 
     // OBS
     $("obs-auto").checked = !!cfg.obs.auto_connect;
@@ -260,6 +262,7 @@
         device: $("audio-device").value,
         use_screen_capture_kit: $("use_sck").checked,
       },
+      filter: filterPresetPatch(),
       obs: {
         auto_connect: $("obs-auto").checked,
         host: $("obs-host").value,
@@ -279,6 +282,14 @@
         animation: $("ov-animation").value,
       },
     };
+  }
+
+  function filterPresetPatch() {
+    const preset = $("filter-preset").value;
+    // These are conservative starting values, not claimed microphone calibration.
+    if (preset === "soft") return { silence_rms: 0.007 };
+    if (preset === "strong") return { silence_rms: 0.020 };
+    return { silence_rms: 0.012 };
   }
 
   function updateProviderUI() {
