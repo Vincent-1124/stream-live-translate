@@ -103,6 +103,16 @@
       endpointDefault: "ws://127.0.0.1:10095",
       className: "online-hint"
     },
+    "bailian": {
+      boxHtml: `<strong>☁️ 百炼云 Fun-ASR</strong><br />使用百炼实时语音识别，默认模型 <code>fun-asr-realtime</code>。API Key 只在本机保存，页面仅显示是否已设置。` ,
+      modelPlaceholder: "fun-asr-realtime",
+      modelSuggestions: [
+        { value: "fun-asr-realtime", label: "fun-asr-realtime（默认）" }
+      ],
+      endpointPlaceholder: "留空使用百炼北京默认端点",
+      endpointDefault: "",
+      className: "qwen-hint"
+    },
     "mock": {
       boxHtml: `<strong>🧪 模拟模式</strong><br />本地模拟输出，不联网、不消耗额度，仅用于界面测试。`,
       modelPlaceholder: "mock",
@@ -118,6 +128,7 @@
     "online": "openai-realtime",
     "local": "openai-realtime",
     "funasr": "fun-asr-realtime",
+    "bailian": "bailian-fun-asr",
     "mock": "mock"
   };
 
@@ -161,6 +172,7 @@
     if (cfg.llm.provider === "qwen-realtime") return "qwen";
     if (cfg.llm.provider === "mock") return "mock";
     if (cfg.llm.provider === "fun-asr-realtime") return "funasr";
+    if (cfg.llm.provider === "bailian-fun-asr") return "bailian";
     if (cfg.llm.provider === "openai-realtime") {
       const ep = cfg.llm.endpoint || "";
       if (ep.includes("bigmodel.cn")) return "glm";
@@ -174,8 +186,13 @@
     const providerType = detectProviderType(cfg);
     $("provider-type").value = providerType;
     $("model").value = cfg.llm.model || "";
-    $("api_key").value = cfg.llm.api_key || "";
+    // /api/config deliberately returns an empty api_key. Never put a saved
+    // secret back into the DOM; the separate boolean is the only status.
+    $("api_key").value = "";
+    $("api-key-status").textContent = cfg.llm.api_key_set ? "✓ 已设置（不会回显）" : "未设置";
+    $("api-key-status").className = "field-status " + (cfg.llm.api_key_set ? "set" : "unset");
     $("endpoint").value = cfg.llm.endpoint || "";
+    $("workspace-id").value = cfg.llm.workspace_id || "";
     $("target_lang").value = cfg.llm.target_lang || "zh";
     $("translate_chinese").checked = !!cfg.llm.translate_chinese;
     $("transcribe").checked = !!cfg.llm.transcribe;
@@ -230,6 +247,7 @@
         model: $("model").value,
         api_key: $("api_key").value,
         endpoint: $("endpoint").value.trim() || null,
+        workspace_id: $("workspace-id").value.trim(),
         target_lang: $("target_lang").value,
         translate_chinese: $("translate_chinese").checked,
         segment_ms: $("low_latency").checked ? (Number($("segment_ms").value) || 1200) : 0,
@@ -286,11 +304,13 @@
     }
 
     const isFunasr = providerType === "funasr";
+    const isBailian = providerType === "bailian";
     const openaiLike = !isFunasr && ["glm", "online", "local"].includes(providerType);
     $("transcribe_row").style.display = openaiLike ? "" : "none";
     $("transcription_model_row").style.display =
       openaiLike && $("transcribe").checked ? "" : "none";
     $("gateway_row").style.display = providerType === "local" ? "" : "none";
+    $("workspace-row").style.display = isBailian ? "" : "none";
     $("low_latency_ms_row").style.display = $("low_latency").checked ? "" : "none";
   }
 
@@ -749,7 +769,8 @@
       const btn = $("save-btn");
       const status = $("save-status");
 
-      if (patch.llm.provider !== "mock" && !key) {
+      const keyAlreadySet = !!(currentConfig && currentConfig.llm && currentConfig.llm.api_key_set);
+      if (patch.llm.provider !== "mock" && !key && !keyAlreadySet) {
         toast("请先填写 API Key", "error");
         status.textContent = "✗ 缺少 API Key";
         status.className = "status err";

@@ -170,6 +170,9 @@ code {
   font-size: 13px;
 }
 .card label.row > span { font-weight: 500; }
+.field-status { display: block; margin-top: 5px; color: var(--text-muted); font-size: 11px; }
+.field-status.set { color: var(--ok); }
+.field-status.unset { color: var(--warn); }
 
 .card input[type=text],
 .card input[type=number],

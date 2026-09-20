@@ -422,6 +422,15 @@
     scheduleHide();
   }
 
+  function replacePartial(text) {
+    // Bailian partial results are cumulative revisions, not deltas.
+    partialBuffer = text || "";
+    pageStart = 0;
+    lastPartialAt = Date.now();
+    show(partialBuffer);
+    scheduleHide();
+  }
+
   function finalize(text) {
     if (text) partialBuffer = text;
     const cleaned = cleanText(partialBuffer);
@@ -476,7 +485,8 @@
           scheduleHide();
         }
       } else if (payload.type === "partial") {
-        appendPartial(payload.text || "");
+        if (payload.replace === true) replacePartial(payload.text || "");
+        else appendPartial(payload.text || "");
       } else if (payload.type === "final") {
         finalize(payload.text || "");
       } else if (payload.type === "cleared") {

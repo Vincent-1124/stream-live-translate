@@ -37,6 +37,7 @@
           <option value="online">OpenAI / 其它在线 API</option>
           <option value="local">本机部署 API（Ollama / LocalAI 等）</option>
           <option value="funasr">FunASR 本地流式识别（自部署）</option>
+          <option value="bailian">百炼云 Fun-ASR（推荐）</option>
           <option value="mock">模拟模式（不消耗额度）</option>
         </select>
       </label>
@@ -50,7 +51,14 @@
 
       <label>
         <span>API Key</span>
-        <input id="api_key" type="password" placeholder="sk-..." />
+        <input id="api_key" type="password" placeholder="sk-...（留空保留已设置的 Key）" autocomplete="new-password" />
+        <small id="api-key-status" class="field-status">未设置</small>
+      </label>
+
+      <label id="workspace-row" style="display:none">
+        <span>业务空间 ID（可选）</span>
+        <input id="workspace-id" type="text" placeholder="留空使用北京公共端点" autocomplete="off" />
+        <small class="field-status">百炼 Model Studio 的业务空间；不填写时使用公共端点。</small>
       </label>
 
       <label>
