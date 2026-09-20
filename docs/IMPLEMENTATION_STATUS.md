@@ -1,0 +1,21 @@
+# 直播中文字幕改版进度
+
+## 基线
+
+- 上游压缩包提交：`c96907d7b5d25a7973ab6f5fcddaf2d56a941b77`（源码压缩包中记录的 Git commit）。
+- 本地基线提交：`18063e7`。上游采用 MIT 许可证，Rust 1.74+、MSVC CMake OBS 薄插件和内嵌管理页/overlay。
+- 实际前端源目录：`admin/`、`overlay/`。`build.rs` 在构建时同步到 `dist/`，因此不要直接修改 `dist/admin` 或 `dist/overlay`。
+- 原始录播和本地分析工具保留在仓库外层工作目录，未加入源码仓库。
+
+## 已完成的离线改动
+
+- 新增 `bailian-fun-asr` provider，独立于旧 `fun-asr-realtime` 本地 FunASR 2pass provider，默认模型为 `fun-asr-realtime`。
+- 按百炼 WebSocket 协议实现 Bearer 鉴权、`run-task`、等待 `task-started`、16k 单声道 PCM 二进制帧、`finish-task`，并解析 `result-generated`、`task-failed`、`task-finished`。
+- 中间结果采用替换语义，避免累计修订重复追加为字幕；overlay 已识别替换事件。
+- `/api/config` 不再返回 API Key；常规空白保存保留已有 Key。
+
+## 仍待验证
+
+- 真实百炼调用、热词服务、OBS、无线麦克风和录播人工标注均未执行：没有使用或请求 API Key。
+- `cargo test` 未能开始编译，因为该机器无法连接 crates.io 拉取依赖；`rustfmt` 组件也未装入隔离工具链。不得据此宣称构建或验收通过。
+- 下一步：网络可用后安装 rustfmt、运行 `cargo fmt --check && cargo test`，再进行模拟 WebSocket 协议测试与独立打包验收。

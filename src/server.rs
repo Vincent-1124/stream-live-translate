@@ -195,8 +195,16 @@ fn respond_embedded(rel: &str) -> Response {
 }
 
 async fn get_config(State(state): State<Arc<AppState>>) -> Response {
+    // Never send the saved secret back to the browser.  The boolean lets the
+    // panel say that a key exists without exposing it in a response or log.
     let cfg = state.config.read().clone();
-    axum::Json(cfg).into_response()
+    let key_set = !cfg.llm.api_key.is_empty();
+    let mut value = serde_json::to_value(cfg).unwrap_or_default();
+    if let Some(llm) = value.get_mut("llm").and_then(|v| v.as_object_mut()) {
+        llm.insert("api_key".into(), serde_json::Value::String(String::new()));
+        llm.insert("api_key_set".into(), serde_json::Value::Bool(key_set));
+    }
+    axum::Json(value).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -212,12 +220,18 @@ async fn post_config(
 ) -> Response {
     // Merge patch onto current config.
     let mut cfg = state.config.read().clone();
+    // An empty password field in a normal settings save means "keep it".  A
+    // later explicit clear endpoint can make removal intentional.
+    let incoming_key_empty = payload.pointer("/llm/api_key").and_then(|v| v.as_str()) == Some("");
     if let Err(e) = merge_json(&mut cfg, &payload) {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response();
+    }
+    if incoming_key_empty {
+        cfg.llm.api_key = state.config.read().llm.api_key.clone();
     }
     // The OBS plugin launches the engine with --audio-mode obs_filter;
     // the audio feed comes from the plugin itself. Never let a panel

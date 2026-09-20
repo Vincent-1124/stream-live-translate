@@ -47,6 +47,7 @@ pub fn build(cfg: &LlmConfig) -> Result<Arc<dyn LlmProvider>> {
         "qwen-realtime" => Ok(Arc::new(qwen::QwenRealtime::new(cfg.clone())?)),
         "openai-realtime" => Ok(Arc::new(openai::OpenAiRealtime::new(cfg.clone())?)),
         "fun-asr-realtime" => Ok(Arc::new(funasr::FunAsr::new(cfg.clone())?)),
+        "bailian-fun-asr" => Ok(Arc::new(bailian::BailianFunAsr::new(cfg.clone())?)),
         "mock" => Ok(Arc::new(mock::MockProvider::new(cfg.clone())?) as Arc<dyn LlmProvider>),
         other => Err(anyhow!("unknown LLM provider `{other}`")),
     }
@@ -960,6 +961,106 @@ pub mod funasr {
                 _ = write => {}
             }
             Ok(())
+        }
+    }
+}
+
+// ---------- Bailian Fun-ASR realtime ----------
+//
+// This is intentionally separate from `funasr`: that provider speaks the
+// self-hosted FunASR 2pass protocol, while Bailian uses run-task followed by
+// raw binary PCM frames.  Keep the two identifiers separate for old configs.
+pub mod bailian {
+    use super::*;
+
+    const PUBLIC_BEIJING_ENDPOINT: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
+
+    pub struct BailianFunAsr { cfg: LlmConfig, endpoint: String }
+
+    impl BailianFunAsr {
+        pub fn new(cfg: LlmConfig) -> Result<Self> {
+            if cfg.api_key.trim().is_empty() { return Err(anyhow!("百炼 API Key 未设置")); }
+            let endpoint = cfg.endpoint.clone().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| {
+                if cfg.workspace_id.trim().is_empty() { PUBLIC_BEIJING_ENDPOINT.to_string() }
+                else { format!("wss://{}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference", cfg.workspace_id.trim()) }
+            });
+            if !endpoint.starts_with("wss://") { return Err(anyhow!("百炼 Fun-ASR 端点必须使用 wss://")); }
+            Ok(Self { cfg, endpoint })
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for BailianFunAsr {
+        fn name(&self) -> &'static str { "bailian-fun-asr" }
+
+        async fn run(self: Arc<Self>, mut audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>, sink: SubtitleSink) -> Result<()> {
+            let mut request = self.endpoint.clone().into_client_request().context("构造百炼 WebSocket 请求")?;
+            request.headers_mut().insert(http::header::AUTHORIZATION, http::HeaderValue::from_str(&format!("Bearer {}", self.cfg.api_key)).context("API Key 不能用于 HTTP 请求头")?);
+            request.headers_mut().insert(http::header::USER_AGENT, http::HeaderValue::from_static("stream-live-translate/0.1"));
+            if !self.cfg.workspace_id.trim().is_empty() {
+                request.headers_mut().insert(http::HeaderName::from_static("x-dashscope-workspace"), http::HeaderValue::from_str(&self.cfg.workspace_id).context("业务空间 ID 不能用于 HTTP 请求头")?);
+            }
+            let (ws, _) = tokio_tungstenite::connect_async(request).await.map_err(|e| ws_connect_error(e, "连接百炼 Fun-ASR"))?;
+            let (mut write, mut read) = ws.split();
+            let task_id = uuid::Uuid::new_v4().to_string();
+            let start = serde_json::json!({
+                "header": { "action": "run-task", "task_id": task_id, "streaming": "duplex" },
+                "payload": { "task_group": "audio", "task": "asr", "function": "recognition", "model": self.cfg.model,
+                    "parameters": { "format": "pcm", "sample_rate": 16000, "semantic_punctuation_enabled": self.cfg.semantic_punctuation_enabled, "speech_noise_threshold": self.cfg.speech_noise_threshold, "heartbeat": true },
+                    "input": {} }
+            });
+            write.send(Message::Text(start.to_string().into())).await.context("启动百炼识别任务")?;
+
+            // Service policy requires task-started before audio.  A bounded
+            // wait avoids silently streaming PCM into a rejected task.
+            let mut started = false;
+            while let Some(message) = read.next().await {
+                let message = message.context("读取百炼启动事件")?;
+                if let Message::Text(text) = message {
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                    match value.pointer("/header/event").and_then(|v| v.as_str()) {
+                        Some("task-started") => { started = true; break; }
+                        Some("task-failed") => return Err(anyhow!("百炼启动失败：{}", value.pointer("/header/error_message").and_then(|v| v.as_str()).unwrap_or("未知错误"))),
+                        _ => {}
+                    }
+                }
+            }
+            if !started { return Err(anyhow!("百炼连接在任务启动前关闭")); }
+
+            let sink_read = sink.clone();
+            let task_for_read = task_id.clone();
+            let reader = async move {
+                while let Some(message) = read.next().await {
+                    let Message::Text(text) = message? else { continue };
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                    if value.pointer("/header/task_id").and_then(|v| v.as_str()) != Some(task_for_read.as_str()) { continue; }
+                    match value.pointer("/header/event").and_then(|v| v.as_str()) {
+                        Some("result-generated") => {
+                            let sentence = &value["payload"]["output"]["sentence"];
+                            if sentence.get("heartbeat").and_then(|v| v.as_bool()) == Some(true) { continue; }
+                            let text = sentence.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+                            if text.is_empty() { continue; }
+                            if sentence.get("sentence_end").and_then(|v| v.as_bool()) == Some(true) { sink_read.push(SubtitleEvent::Final(text.to_string())); }
+                            else { sink_read.push(SubtitleEvent::Replace(text.to_string())); }
+                        }
+                        Some("task-failed") => return Err(anyhow!("百炼任务失败：{}", value.pointer("/header/error_message").and_then(|v| v.as_str()).unwrap_or("未知错误"))),
+                        Some("task-finished") => return Ok(()),
+                        _ => {}
+                    }
+                }
+                Ok(())
+            };
+            let writer = async move {
+                while let Some(chunk) = audio_rx.recv().await {
+                    if chunk.is_empty() { continue; }
+                    let bytes: Vec<u8> = chunk.iter().flat_map(|s| s.to_le_bytes()).collect();
+                    write.send(Message::Binary(bytes.into())).await.context("发送百炼音频")?;
+                }
+                let finish = serde_json::json!({ "header": { "action": "finish-task", "task_id": task_id, "streaming": "duplex" }, "payload": { "input": {} } });
+                let _ = write.send(Message::Text(finish.to_string().into())).await;
+                Ok(())
+            };
+            tokio::select! { result = reader => result, result = writer => result }
         }
     }
 }

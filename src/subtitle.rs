@@ -13,6 +13,9 @@ use tokio::sync::broadcast;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SubtitleEvent {
     Partial(String),
+    /// Full replacement for a provider's still-open sentence.  Bailian sends
+    /// cumulative revisions, so treating those as Partial would duplicate text.
+    Replace(String),
     Final(String),
     Cleared,
 }
@@ -58,6 +61,17 @@ impl SubtitleSink {
                         updated_at_ms: now,
                         finalised: false,
                     });
+                }
+            }
+            SubtitleEvent::Replace(text) => {
+                let mut s = self.state.lock();
+                let now = chrono::Utc::now().timestamp_millis();
+                if let Some(cur) = s.current.as_mut() {
+                    cur.text = text.clone();
+                    cur.updated_at_ms = now;
+                    cur.finalised = false;
+                } else {
+                    s.current = Some(SubtitleLine { id: uuid::Uuid::new_v4().to_string(), text: text.clone(), language: "auto".into(), started_at_ms: now, updated_at_ms: now, finalised: false });
                 }
             }
             SubtitleEvent::Final(text) => {
@@ -167,6 +181,7 @@ impl SubtitleHub {
 pub fn ws_payload(ev: &SubtitleEvent) -> serde_json::Value {
     match ev {
         SubtitleEvent::Partial(text) => serde_json::json!({"type": "partial", "text": text}),
+        SubtitleEvent::Replace(text) => serde_json::json!({"type": "partial", "text": text, "replace": true}),
         SubtitleEvent::Final(text) => serde_json::json!({"type": "final", "text": text}),
         SubtitleEvent::Cleared => serde_json::json!({"type": "cleared"}),
     }
@@ -205,6 +220,8 @@ mod tests {
         assert_eq!(p, serde_json::json!({"type": "partial", "text": "hello"}));
         let f = ws_payload(&SubtitleEvent::Final("world".to_string()));
         assert_eq!(f, serde_json::json!({"type": "final", "text": "world"}));
+        let r = ws_payload(&SubtitleEvent::Replace("fixed".to_string()));
+        assert_eq!(r, serde_json::json!({"type":"partial", "text":"fixed", "replace":true}));
         let c = ws_payload(&SubtitleEvent::Cleared);
         assert_eq!(c, serde_json::json!({"type": "cleared"}));
     }

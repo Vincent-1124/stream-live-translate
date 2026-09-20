@@ -70,7 +70,21 @@ pub struct LlmConfig {
     /// response.create 触发网关出结果。
     #[serde(default)]
     pub gateway_text: bool,
+    /// Optional Model Studio workspace.  When present, the Bailian provider
+    /// uses the workspace-specific Beijing endpoint; an endpoint override
+    /// always wins.
+    #[serde(default)]
+    pub workspace_id: String,
+    /// Bailian server-side speech/noise sensitivity.  The value is deliberately
+    /// configurable because it must be calibrated against the actual mic.
+    #[serde(default = "default_speech_noise_threshold")]
+    pub speech_noise_threshold: f32,
+    #[serde(default = "default_semantic_punctuation")]
+    pub semantic_punctuation_enabled: bool,
 }
+
+fn default_speech_noise_threshold() -> f32 { 0.0 }
+fn default_semantic_punctuation() -> bool { true }
 
 fn default_ingest_port() -> u16 {
     8788
@@ -193,9 +207,9 @@ impl Default for Config {
                 static_dir: PathBuf::from("dist"),
             },
             llm: LlmConfig {
-                provider: "qwen-realtime".into(),
+                provider: "bailian-fun-asr".into(),
                 api_key: String::new(),
-                model: "qwen3.5-livetranslate-flash-realtime".into(),
+                model: "fun-asr-realtime".into(),
                 endpoint: None,
                 target_lang: "zh".into(),
                 translate_chinese: false,
@@ -204,6 +218,9 @@ impl Default for Config {
                 transcribe: false,
                 transcription_model: String::new(),
                 gateway_text: false,
+                workspace_id: String::new(),
+                speech_noise_threshold: default_speech_noise_threshold(),
+                semantic_punctuation_enabled: default_semantic_punctuation(),
             },
             audio: AudioConfig {
                 mode: "system".into(),
