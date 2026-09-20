@@ -86,7 +86,13 @@ if (-not $obsDll) {
     if (-not (Test-Path $zip)) {
         Invoke-WebRequest -Uri "https://github.com/obsproject/obs-studio/releases/download/$ObsVersion/OBS-Studio-$ObsVersion-Windows.zip" -OutFile $zip
     }
-    Expand-Archive -Path $zip -DestinationPath "$WorkDir\obs-full" -Force
+    $obsFull = Join-Path $WorkDir "obs-full"
+    if (-not (Test-Path $obsFull)) {
+        # Developer PowerShell can fail to load Microsoft.PowerShell.Archive.
+        # The .NET extractor is available in both normal and VS shells.
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $obsFull)
+    }
     $obsDll = (Get-ChildItem "$WorkDir\obs-full" -Recurse -Filter obs.dll |
         Select-Object -First 1).FullName
 }
