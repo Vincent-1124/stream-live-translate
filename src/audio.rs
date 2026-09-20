@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, SampleRate, Stream, StreamConfig};
+use cpal::{SampleFormat, Stream, StreamConfig};
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
@@ -88,28 +88,19 @@ impl AudioCapturer {
             .or_else(|_| device.default_output_config())
             .map_err(|e| anyhow!("device has no usable config: {e}"))?;
 
-        let target_rate = if self.cfg.sample_rate == 0 {
-            supported.sample_rate().0
-        } else {
-            self.cfg.sample_rate
-        };
-        let target_channels = if self.cfg.channels == 0 {
-            supported.channels()
-        } else {
-            self.cfg.channels
-        };
-
-        let config = StreamConfig {
-            channels: target_channels,
-            sample_rate: SampleRate(target_rate),
-            buffer_size: cpal::BufferSize::Default,
-        };
+        // Open the device using a format it actually advertises.  Forcing a
+        // 16 kHz stream on a 48 kHz-only wireless receiver makes cpal fail
+        // before we can resample it.  The callback converts native audio to
+        // the configured mono pipeline rate below.
+        let config: StreamConfig = supported.config();
+        let input_rate = config.sample_rate.0;
+        let output_rate = if self.cfg.sample_rate == 0 { 16_000 } else { self.cfg.sample_rate };
 
         let sample_format = supported.sample_format();
         let stream = match sample_format {
-            SampleFormat::F32 => build_stream::<f32>(&device, &config, tx.clone()),
-            SampleFormat::I16 => build_stream::<i16>(&device, &config, tx.clone()),
-            SampleFormat::U16 => build_stream::<u16>(&device, &config, tx.clone()),
+            SampleFormat::F32 => build_stream::<f32>(&device, &config, tx.clone(), output_rate),
+            SampleFormat::I16 => build_stream::<i16>(&device, &config, tx.clone(), output_rate),
+            SampleFormat::U16 => build_stream::<u16>(&device, &config, tx.clone(), output_rate),
             other => {
                 return Err(anyhow!(
                     "unsupported sample format {other:?}; please file an issue"
@@ -123,14 +114,16 @@ impl AudioCapturer {
         *self.state.lock() = Some(CaptureHandle {
             stream,
             spec: CaptureSpec {
-                sample_rate: target_rate,
-                channels: target_channels,
+                sample_rate: output_rate,
+                channels: 1,
             },
         });
 
         info!(
-            rate = target_rate,
-            channels = target_channels,
+            input_rate,
+            input_channels = config.channels,
+            output_rate,
+            output_channels = 1,
             format = ?sample_format,
             "audio capture started"
         );
@@ -210,6 +203,7 @@ fn build_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
     tx: PcmSender,
+    output_rate: u32,
 ) -> Result<Stream>
 where
     T: cpal::Sample + cpal::SizedSample + Send + 'static,
@@ -217,6 +211,7 @@ where
 {
     let err_tx = tx.clone();
     let channels = config.channels as usize;
+    let input_rate = config.sample_rate.0;
     let stream = device.build_input_stream(
         config,
         move |data: &[T], _info| {
@@ -230,6 +225,7 @@ where
                 out.push((mono.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
             }
             // Best-effort send; drop on backpressure.
+            let out = resample_mono(&out, input_rate, output_rate);
             let _ = err_tx.try_send(out);
         },
         move |err| {
@@ -282,6 +278,19 @@ pub fn resample_mono(input: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
         out.push(v as i16);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resample_mono;
+
+    #[test]
+    fn resamples_48khz_mono_to_16khz_duration() {
+        let input: Vec<i16> = (0..4_800).map(|n| n as i16).collect();
+        let output = resample_mono(&input, 48_000, 16_000);
+        assert_eq!(output.len(), 1_600);
+        assert_eq!(output[0], input[0]);
+    }
 }
 
 #[cfg(target_os = "macos")]
