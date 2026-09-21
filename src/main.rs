@@ -57,6 +57,10 @@ struct Cli {
     /// The value is persisted into config.toml.
     #[arg(long, global = true)]
     audio_mode: Option<String>,
+    /// Temporary local PCM ingest port. Unlike --audio-mode this override is
+    /// deliberately not persisted, so a replay run cannot alter an OBS setup.
+    #[arg(long, global = true)]
+    ingest_port: Option<u16>,
 }
 
 pub struct AppState {
@@ -171,6 +175,10 @@ async fn main() -> Result<()> {
         } else {
             info!(mode = %mode, "audio mode overridden by CLI");
         }
+    }
+    if let Some(port) = cli.ingest_port {
+        cfg.audio.ingest_port = port;
+        info!(port, "audio ingest port overridden for this process only");
     }
 
     let subtitle = Arc::new(subtitle::SubtitleHub::default());
