@@ -10,7 +10,7 @@ SHA-256：`3251A0DBC5864D0FE5C00CE4D90C8F9A8A8BEBCEEC4BA97D2B182C293805302B`
 
 | 项目 | 结果 | 证据 |
 |---|---|---|
-| Rust 单元测试 | 通过 | `cargo test`：13 passed，0 failed |
+| Rust 单元测试 | 通过 | `cargo test`：15 passed，0 failed |
 | 管理页与 overlay 脚本 | 通过 | `node --check admin/app.js`、`node --check overlay/app.js` |
 | 百炼协议模拟 | 通过 | 覆盖 task-started 门控、partial/final、task-failed、旧/迟到 task ID |
 | 配置兼容 | 通过 | 新默认百炼配置及缺少新增字段的旧配置反序列化测试 |
