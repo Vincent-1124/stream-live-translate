@@ -35,11 +35,24 @@ pub trait LlmProvider: Send + Sync {
 
     /// Open the streaming session. `on_event` is invoked for every partial
     /// or final transcript the model produces.
+    ///
+    /// `context_rounds` 是热词（R10）经官方"上下文增强"下发的轮次文本，已按
+    /// 400 字符/轮切好；为空表示本次会话不携带上下文。只有百炼 Fun-ASR 通道
+    /// 会把它放进 `run-task` 的 `payload.input.context`。
     async fn run(
         self: Arc<Self>,
         audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
         sink: SubtitleSink,
+        context_rounds: Vec<String>,
     ) -> Result<()>;
+
+    /// 运行期热词源。pipeline 在会话启动前后都会写入；百炼通道订阅它并在
+    /// 词表变化时用 `continue-task` 下发。默认忽略（其它通道暂不支持热词）。
+    fn set_hotwords(&self, _feed: crate::hotwords::HotwordFeed) {}
+
+    /// 热词下发状态槽；provider 每次真正下发后写一次。
+    fn set_hotword_status(&self, _status: Arc<parking_lot::RwLock<crate::hotwords::HotwordStatus>>) {
+    }
 }
 
 pub fn build(cfg: &LlmConfig) -> Result<Arc<dyn LlmProvider>> {
@@ -132,6 +145,7 @@ pub mod qwen {
             self: Arc<Self>,
             mut audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
             sink: SubtitleSink,
+            _context_rounds: Vec<String>,
         ) -> Result<()> {
             let url = format!("{}?model={}", self.endpoint, self.cfg.model);
             let mut req = url
@@ -600,6 +614,7 @@ pub mod openai {
             self: Arc<Self>,
             mut audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
             sink: SubtitleSink,
+            _context_rounds: Vec<String>,
         ) -> Result<()> {
             let url = format!("{}?model={}", self.endpoint, self.cfg.model);
             let mut req = url.into_client_request()?;
@@ -828,6 +843,7 @@ pub mod funasr {
             self: Arc<Self>,
             mut audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
             sink: SubtitleSink,
+            _context_rounds: Vec<String>,
         ) -> Result<()> {
             let url = self.endpoint.clone();
             let (ws, _resp) = tokio_tungstenite::connect_async(url)
@@ -1055,7 +1071,22 @@ pub mod bailian {
         }
     }
 
-    pub struct BailianFunAsr { cfg: LlmConfig, endpoint: String }
+    /// 百炼 Fun-ASR 实时通道。
+    ///
+    /// 热词（R10）走官方「上下文增强」：`run-task` 携带 `payload.input.context`，
+    /// 会话运行中词表变化则用 `continue-task` 更新。**不使用** `vocabulary`
+    /// 即时热词字段——`fun-asr-realtime` 不支持它。
+    pub struct BailianFunAsr {
+        cfg: LlmConfig,
+        endpoint: String,
+        /// 运行期热词源（管理页保存后由 pipeline 写入）。
+        hotwords: crate::hotwords::HotwordFeed,
+        /// 热词下发状态槽，供管理页显示。
+        hotword_status: Arc<parking_lot::RwLock<crate::hotwords::HotwordStatus>>,
+        /// pipeline 注入的共享状态槽；注入后以它为准。
+        shared_hotword_status:
+            Arc<parking_lot::RwLock<Option<Arc<parking_lot::RwLock<crate::hotwords::HotwordStatus>>>>>,
+    }
 
     impl BailianFunAsr {
         pub fn new(cfg: LlmConfig) -> Result<Self> {
@@ -1065,12 +1096,25 @@ pub mod bailian {
                 else { format!("wss://{}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference", cfg.workspace_id.trim()) }
             });
             if !endpoint.starts_with("wss://") { return Err(anyhow!("百炼 Fun-ASR 端点必须使用 wss://")); }
-            Ok(Self { cfg, endpoint })
+            let hotwords = crate::hotwords::HotwordFeed::new();
+            hotwords.set(crate::hotwords::plan(&cfg.hotwords));
+            Ok(Self {
+                cfg,
+                endpoint,
+                hotwords,
+                hotword_status: Arc::new(parking_lot::RwLock::new(
+                    crate::hotwords::HotwordStatus::default(),
+                )),
+                shared_hotword_status: Arc::new(parking_lot::RwLock::new(None)),
+            })
         }
     }
 
     pub async fn test_connection(cfg: LlmConfig) -> Result<()> {
         let provider = BailianFunAsr::new(cfg)?;
+        // 连接测试也携带已保存的热词，这样"测试已保存的连接"能覆盖
+        // 上下文增强的请求形状（形状错误会在这里暴露为任务启动失败）。
+        let input = provider.hotwords.plan().input_json();
         let mut request = provider.endpoint.into_client_request().context("构造百炼 WebSocket 请求")?;
         request.headers_mut().insert(http::header::AUTHORIZATION, http::HeaderValue::from_str(&format!("Bearer {}", provider.cfg.api_key)).context("API Key 不能用于 HTTP 请求头")?);
         if !provider.cfg.workspace_id.trim().is_empty() {
@@ -1082,7 +1126,7 @@ pub mod bailian {
         let start = serde_json::json!({
             "header": { "action": "run-task", "task_id": task_id, "streaming": "duplex" },
             "payload": { "task_group": "audio", "task": "asr", "function": "recognition", "model": provider.cfg.model,
-                "parameters": { "format": "pcm", "sample_rate": 16000, "semantic_punctuation_enabled": provider.cfg.semantic_punctuation_enabled, "speech_noise_threshold": provider.cfg.speech_noise_threshold, "heartbeat": true }, "input": {} }
+                "parameters": { "format": "pcm", "sample_rate": 16000, "semantic_punctuation_enabled": provider.cfg.semantic_punctuation_enabled, "speech_noise_threshold": provider.cfg.speech_noise_threshold, "heartbeat": true }, "input": input }
         });
         write.send(Message::Text(start.to_string().into())).await.context("启动百炼识别测试")?;
         let started = tokio::time::timeout(std::time::Duration::from_secs(8), async {
@@ -1121,7 +1165,27 @@ pub mod bailian {
     impl LlmProvider for BailianFunAsr {
         fn name(&self) -> &'static str { "bailian-fun-asr" }
 
-        async fn run(self: Arc<Self>, mut audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>, sink: SubtitleSink) -> Result<()> {
+        fn set_hotwords(&self, feed: crate::hotwords::HotwordFeed) {
+            // 必须**共享同一个** feed，而不是把自己的那份覆盖掉：管理页保存时
+            // 写的是 AppState 里的 feed，运行中的 continue-task 靠订阅它才能收到。
+            // （先前这里写成 self.hotwords.set(feed.plan())，结果 provider 订阅的
+            //  是另一个实例，热词更新永远到不了会话里——已由实测日志定位。）
+            self.hotwords.adopt(&feed);
+        }
+
+        fn set_hotword_status(
+            &self,
+            status: Arc<parking_lot::RwLock<crate::hotwords::HotwordStatus>>,
+        ) {
+            *self.shared_hotword_status.write() = Some(status);
+        }
+
+        async fn run(
+            self: Arc<Self>,
+            mut audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
+            sink: SubtitleSink,
+            context_rounds: Vec<String>,
+        ) -> Result<()> {
             let mut request = self.endpoint.clone().into_client_request().context("构造百炼 WebSocket 请求")?;
             request.headers_mut().insert(http::header::AUTHORIZATION, http::HeaderValue::from_str(&format!("Bearer {}", self.cfg.api_key)).context("API Key 不能用于 HTTP 请求头")?);
             request.headers_mut().insert(http::header::USER_AGENT, http::HeaderValue::from_static("stream-live-translate/0.1"));
@@ -1131,11 +1195,29 @@ pub mod bailian {
             let (ws, _) = tokio_tungstenite::connect_async(request).await.map_err(|e| ws_connect_error(e, "连接百炼 Fun-ASR"))?;
             let (mut write, mut read) = ws.split();
             let task_id = uuid::Uuid::new_v4().to_string();
+
+            // 热词（上下文增强）：会话开始时下发的轮次由 pipeline 传入；
+            // 运行中的更新走订阅到的 watch 通道，用 continue-task 下发。
+            let full_plan = self.hotwords.plan();
+            let initial_plan = crate::hotwords::plan_from_rounds(&full_plan, context_rounds);
+            let mut hotword_rx = self.hotwords.subscribe();
+            let mut applied = initial_plan.fingerprint();
+            // 有 pipeline 注入的共享槽就写它（管理页读的是那一个）。
+            let status_slot = self
+                .shared_hotword_status
+                .read()
+                .clone()
+                .unwrap_or_else(|| self.hotword_status.clone());
+            let _ = hotword_rx.borrow_and_update();
+            status_slot
+                .write()
+                .record_applied(&initial_plan, "run-task", chrono::Utc::now());
+
             let start = serde_json::json!({
                 "header": { "action": "run-task", "task_id": task_id, "streaming": "duplex" },
                 "payload": { "task_group": "audio", "task": "asr", "function": "recognition", "model": self.cfg.model,
-                    "parameters": { "format": "pcm", "sample_rate": 16000, "semantic_punctuation_enabled": self.cfg.semantic_punctuation_enabled, "speech_noise_threshold": self.cfg.speech_noise_threshold, "heartbeat": true },
-                    "input": {} }
+                    "parameters": { "format": "pcm", "sample_rate": 16000, "semantic_punctuation_enabled": self.cfg.semantic_punctuation_enabled, "speech_noise_threshold": self.cfg.speech_noise_threshold, "heartbeat": true, "language_hints": ["zh"] },
+                    "input": initial_plan.input_json() }
             });
             write.send(Message::Text(start.to_string().into())).await.context("启动百炼识别任务")?;
 
@@ -1169,13 +1251,44 @@ pub mod bailian {
                 }
                 Ok::<(), anyhow::Error>(())
             };
+            let task_for_write = task_id.clone();
             let writer = async move {
-                while let Some(chunk) = audio_rx.recv().await {
-                    if chunk.is_empty() { continue; }
-                    let bytes: Vec<u8> = chunk.iter().flat_map(|s| s.to_le_bytes()).collect();
-                    write.send(Message::Binary(bytes.into())).await.context("发送百炼音频")?;
+                loop {
+                    // 注意：这里**不能**用 `biased;`。音频每 ~20 ms 就到一帧，
+                    // 一旦让 select 永远优先音频，热词分支就永远轮不到，
+                    // continue-task 会被静默饿死（实测：60 秒会话一次都没触发）。
+                    // tokio 默认随机轮询，任何一个分支就绪都会被选中。
+                    tokio::select! {
+                        chunk = audio_rx.recv() => {
+                            let Some(chunk) = chunk else { break };
+                            if chunk.is_empty() { continue; }
+                            let bytes: Vec<u8> = chunk.iter().flat_map(|s| s.to_le_bytes()).collect();
+                            write.send(Message::Binary(bytes.into())).await.context("发送百炼音频")?;
+                        }
+                        changed = hotword_rx.changed() => {
+                            if changed.is_err() {
+                                // 发送端消失（feed 已被丢弃）：不会再有新词表。
+                                // 退出等待避免空转，音频分支继续用 biased 优先。
+                                continue;
+                            }
+                            let next = hotword_rx.borrow_and_update().clone();
+                            let fingerprint = next.fingerprint();
+                            if fingerprint == applied {
+                                // 不变更不重发：仅记账，不占用服务端上下文轮次。
+                                status_slot.write().record_skipped(&next);
+                                continue;
+                            }
+                            let update = serde_json::json!({
+                                "header": { "action": "continue-task", "task_id": task_for_write, "streaming": "duplex" },
+                                "payload": { "input": next.input_json() }
+                            });
+                            write.send(Message::Text(update.to_string().into())).await.context("下发百炼热词上下文")?;
+                            applied = fingerprint;
+                            status_slot.write().record_applied(&next, "continue-task", chrono::Utc::now());
+                        }
+                    }
                 }
-                let finish = serde_json::json!({ "header": { "action": "finish-task", "task_id": task_id, "streaming": "duplex" }, "payload": { "input": {} } });
+                let finish = serde_json::json!({ "header": { "action": "finish-task", "task_id": task_for_write, "streaming": "duplex" }, "payload": { "input": {} } });
                 let _ = write.send(Message::Text(finish.to_string().into())).await;
                 Ok::<(), anyhow::Error>(())
             };
@@ -1283,6 +1396,7 @@ pub mod mock {
             self: Arc<Self>,
             mut audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
             sink: SubtitleSink,
+            _context_rounds: Vec<String>,
         ) -> Result<()> {
             let phrases = [
                 ("Hello everyone, welcome to the stream.", "大家好，欢迎来到直播间。"),

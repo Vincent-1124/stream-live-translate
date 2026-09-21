@@ -22,9 +22,24 @@
   let displayTimer = null;
   let pendingText = null;
   let displayDelayMs = 750;
+  /// 最后一条字幕事件后自动清屏的时长（服务端 overlay.clear_after_ms）。
+  let clearAfterMs = 4000;
   let partialBuffer = "";
-  let lastPartialAt = 0;
   let ws = null;
+
+  // WebSocket 断线重连：指数退避 + 抖动，避免服务端重启期间刷屏重连。
+  const WS_RETRY_MIN_MS = 500;
+  const WS_RETRY_MAX_MS = 15000;
+  /// 超过该时长没有收到任何帧（含 pong）就判定连接半开并主动重连。
+  const WS_STALE_MS = 30000;
+  const WS_PING_MS = 10000;
+  /// 服务端在 server.rs 中回以 "pong"，用来证明链路仍然活着。
+  const WS_PING_TEXT = "ping";
+  let wsRetryDelay = WS_RETRY_MIN_MS;
+  let wsRetryTimer = null;
+  let wsPingTimer = null;
+  let wsLastFrameAt = 0;
+  let wsGeneration = 0;
 
   const WATERMARK_WORDS = [
     "字幕", "subtitle", "翻译", "translate", "实时", "real-time", "live",
@@ -189,10 +204,26 @@
     if (maxH <= 0) return full;
     // 文本被替换成更短的内容时下标会越界，回到开头。
     if (pageStart > full.length) pageStart = 0;
-    if (measureHeight(full.slice(pageStart)) > maxH) {
-      pageStart = findCut(full, pageStart, maxH);
+    const cut = findCut(full, pageStart, maxH);
+    // Only hand the whole tail over when the tail itself fits on one page.
+    // Otherwise render EXACTLY the measured slice: `cut` is the END index of
+    // the longest slice that fits (findCut's binary search returns `best` from
+    // `full.slice(start, mid)`), so anything past `cut` belongs to the next
+    // page. Returning `full.slice(pageStart)` here was the off-by-one that let
+    // a page render one character more than was ever measured, which put a
+    // third line on screen for cumulative-revision (`replace: true`) streams.
+    if (cut >= full.length) return full.slice(pageStart);
+    // `cut <= pageStart` means the cursor no longer belongs to this text (a
+    // revised revision can move the tail). Showing `slice(pageStart, cut)` would
+    // be empty and the old fallback rendered text that is not part of `full` at
+    // all, so restart this sentence from its beginning.
+    if (cut <= pageStart) {
+      pageStart = 0;
+      return full.slice(0, cut);
     }
-    return full.slice(pageStart);
+    const shown = full.slice(pageStart, cut);
+    pageStart = cut;
+    return shown;
   }
 
   /// 文字或行数/字号变化后重画当前这句。
@@ -346,6 +377,11 @@
     if (ov.display_delay_ms !== undefined) {
       displayDelayMs = Math.min(1000, Math.max(500, Number(ov.display_delay_ms) || 750));
     }
+    if (ov.clear_after_ms !== undefined) {
+      const ms = Number(ov.clear_after_ms);
+      // 1–15 秒：短到不至于残留旧字幕，长到足够读完一句话。
+      if (isFinite(ms) && ms > 0) clearAfterMs = Math.min(15000, Math.max(1000, ms));
+    }
     renderStyle();
     setBodyVariant("position", ov.position);
     setBodyVariant("animation", ov.animation);
@@ -388,7 +424,13 @@
   }
 
   function renderShow(text) {
-    if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+    // Deliberately does NOT touch `hideTimer`. The silence timer is armed when
+    // a subtitle event arrives (scheduleHide), and a buffered first render used
+    // to cancel it here — so the page that reached the screen through the
+    // display buffer was never cleared and stayed up until the next event.
+    // Every caller re-arms the timer with scheduleHide() right after this
+    // returns, so letting the arrival-time deadline stand is both correct and
+    // what the buffer contract promises.
     const line = toSingleLine(text);
     currentText = line;
     captionEl.classList.remove("empty");
@@ -422,6 +464,11 @@
     // A completed silence period starts a new page. Keeping stale text here
     // would bypass the next page's display buffer and let resize re-render it.
     currentText = "";
+    // The accumulated sentence ends with the page. Leaving it behind glued the
+    // NEXT sentence onto the old tail (`<old><new>`), because both
+    // appendPartial and the `grew` check in replacePartial treat an empty
+    // buffer as "this is a fresh sentence".
+    partialBuffer = "";
     captionEl.classList.add("empty");
     captionEl.classList.remove("show");
     pageStart = 0;
@@ -429,14 +476,12 @@
     if (textEl) textEl.textContent = "";
   }
 
-  const HIDE_DELAY = 4000;   // 没有新内容时字幕自动隐藏的时间
-
   function scheduleHide(extraMs) {
     if (hideTimer) clearTimeout(hideTimer);
     hideTimer = setTimeout(() => {
       hide();
       recentSentences.length = 0;
-    }, HIDE_DELAY + (extraMs || 0));
+    }, clearAfterMs + (extraMs || 0));
   }
 
   function appendPartial(delta) {
@@ -444,7 +489,6 @@
     // 上一句已经收尾（finalize 会清空 buffer），这是新的一句，从头开始显示。
     if (partialBuffer.length === 0) pageStart = 0;
     partialBuffer += delta;
-    lastPartialAt = Date.now();
     // 不做任何过滤，直接渲染：cleanText 的水印词表是针对整句设计的，
     // 套在流式片段上会误伤（delta 恰好是 "live" / "AI" 就被整段丢掉），
     // 既吞内容又让人误以为字幕要等说完才出。水印只在 finalize 时清理。
@@ -454,9 +498,19 @@
 
   function replacePartial(text) {
     // Bailian partial results are cumulative revisions, not deltas.
-    partialBuffer = text || "";
-    pageStart = 0;
-    lastPartialAt = Date.now();
+    const next = text || "";
+    // Same sentence only while one revision is an extension of the other.
+    // `next.startsWith(partialBuffer)` alone is not enough: real ASR revisions
+    // also shift text near the tail (frame N is neither equal to nor a prefix of
+    // frame N+1), and treating those as "same page" left `pageStart` past the
+    // end of the new text so the caption rendered the PREVIOUS sentence's tail.
+    // Either direction counts as the same sentence (growth, or a trim of the
+    // same text); anything else starts a new one.
+    const sameSentence =
+      partialBuffer.length > 0 &&
+      (next.startsWith(partialBuffer) || partialBuffer.startsWith(next));
+    if (!sameSentence) pageStart = 0;
+    partialBuffer = next;
     show(partialBuffer);
     scheduleHide();
   }
@@ -495,15 +549,64 @@
     }
   }
 
+  function stopWsTimers() {
+    if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
+    if (wsPingTimer) { clearInterval(wsPingTimer); wsPingTimer = null; }
+  }
+
+  /// 重连排队。退避从 500 ms 起翻倍到 15 s，并加最多 40% 抖动，避免服务端
+  /// 重启后多个浏览器源在同一毫秒一起撞上来。
+  function scheduleReconnect() {
+    if (wsRetryTimer) return;
+    const jitter = Math.random() * wsRetryDelay * 0.4;
+    const wait = Math.round(wsRetryDelay + jitter);
+    console.warn(`overlay ws reconnecting in ${wait} ms`);
+    wsRetryTimer = setTimeout(() => {
+      wsRetryTimer = null;
+      connectWS();
+    }, wait);
+    wsRetryDelay = Math.min(WS_RETRY_MAX_MS, wsRetryDelay * 2);
+  }
+
   function connectWS() {
+    stopWsTimers();
+    const generation = ++wsGeneration;
     const wsScheme = location.protocol === "https:" ? "wss" : "ws";
-    ws = new WebSocket(`${wsScheme}://${location.host}/ws/subtitles`);
+    const url = `${wsScheme}://${location.host}/ws/subtitles`;
+    try {
+      ws = new WebSocket(url);
+    } catch (e) {
+      console.warn("overlay ws construction failed", e);
+      scheduleReconnect();
+      return;
+    }
+    wsLastFrameAt = Date.now();
     ws.addEventListener("open", () => {
       console.log("overlay ws connected");
+      wsRetryDelay = WS_RETRY_MIN_MS;
+      wsLastFrameAt = Date.now();
       // 兜底：即使服务端是旧版（不会主动推 config），重连后也能拿到最新样式。
       loadConfig();
+      // 半开检测：连上了但长时间收不到任何帧时，TCP 可能已经断了而浏览器
+      // 还没触发 close。定时发 ping 并检查最后收帧时间，必要时主动重连。
+      wsPingTimer = setInterval(() => {
+        if (generation !== wsGeneration) return;
+        if (Date.now() - wsLastFrameAt > WS_STALE_MS) {
+          console.warn("overlay ws stale, forcing reconnect");
+          try { ws.close(); } catch {}
+          scheduleReconnect();
+          return;
+        }
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          try { ws.send(WS_PING_TEXT); } catch {}
+        }
+      }, WS_PING_MS);
     });
     ws.addEventListener("message", (ev) => {
+      wsLastFrameAt = Date.now();
+      // Liveness pong from the server: it is proof of life but carries no
+      // subtitle payload, so it must not be parsed as one.
+      if (ev.data === "pong") return;
       let payload;
       try { payload = JSON.parse(ev.data); } catch { return; }
       if (payload.type === "config") {
@@ -524,22 +627,47 @@
       }
     });
     ws.addEventListener("close", () => {
-      setTimeout(connectWS, 2000);
+      if (generation !== wsGeneration) return;
+      if (wsPingTimer) { clearInterval(wsPingTimer); wsPingTimer = null; }
+      scheduleReconnect();
+    });
+    ws.addEventListener("error", () => {
+      if (generation !== wsGeneration) return;
+      console.warn("overlay ws error");
     });
   }
 
   // A browser-only inspection path for layout and timing regressions.  It
   // never sends audio, does not alter the server's subtitle history, and is
   // opt-in so normal OBS browser sources are unchanged.
+  //
+  // 事件顺序刻意做成一次完整回归：
+  //   0.0 s  替换语义 partial 修订（累计修订不应被重复追加）
+  //   0.5 s  短 Final 覆盖更长的 partial
+  //   1.0 s  两行分页样本（约 100 字，两行装不下 → 必须换页且不出现第三行）
+  //   1.5 s  同一句的 Final 收尾
+  //   2.2 s  超长句（146 字 → 实测换页 2 次），确认翻过的内容不会整段重现
+  //   约 6.2 s（最后一条事件 + 4 s 配置值）自动清屏；默认 clear_after_ms
+  //          被改动时清屏时刻会随之后移。
+  //
+  // 浏览器源宽度会影响换页次数：上面两条样本在 1600 px 上限、48 px 字号下
+  // （约 32 字/行）分别需要 2 页和 3 页，最宽时也不会出现第三行。
+  const REPLAY_PAGED =
+    "这是一段用于验证两行分页的本地模拟字幕，它足够长，应该在当前页面填满后切换到后续文字页面，而不产生第三行或滚动。";
+  const REPLAY_VERY_LONG =
+    "直播字幕遇到特别长的句子时必须持续换页而不能依赖滚动，所以这一段刻意写得比两行长得多：它要确认翻过去的内容不会在下一帧整段重新出现，也要确认全程没有任何一帧同时显示三行，并且换页之后仍能一直读到句尾。" +
+    "如果句子还能更长，分页逻辑也应当继续推进到最后一页，而不是把尾巴丢掉或者让背景高度撑成三行。";
+
   function startLocalReplayIfRequested() {
     if (new URLSearchParams(location.search).get("local-replay") !== "1") return;
     document.body.dataset.localReplay = "running";
     const events = [
       [0, () => replacePartial("这是正在修订的一句字幕，先显示较长的识别结果。")],
       [500, () => finalize("这是修订后的字幕。")],
-      [1000, () => replacePartial("这是一段用于验证两行分页的本地模拟字幕，它足够长，应该在当前页面填满后切换到后续文字页面，而不产生第三行或滚动。")],
-      [1500, () => finalize("这是一段用于验证两行分页的本地模拟字幕，它足够长，应该在当前页面填满后切换到后续文字页面，而不产生第三行或滚动。")],
-      [5600, () => { document.body.dataset.localReplay = "complete"; }],
+      [1000, () => replacePartial(REPLAY_PAGED)],
+      [1500, () => finalize(REPLAY_PAGED)],
+      [2200, () => replacePartial(REPLAY_VERY_LONG)],
+      [6200, () => { document.body.dataset.localReplay = "complete"; }],
     ];
     for (const [delay, run] of events) setTimeout(run, delay);
   }

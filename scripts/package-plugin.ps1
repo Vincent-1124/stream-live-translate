@@ -41,6 +41,36 @@ if (-not [System.IO.Path]::IsPathRooted($WorkDir)) {
 
 function Step([string]$msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
 
+# Native tools (cargo, git, cmake, dumpbin, lib) routinely write progress and
+# warnings to stderr.  Under $ErrorActionPreference = "Stop", Windows
+# PowerShell 5.1 promotes those stderr lines to *terminating*
+# NativeCommandErrors as soon as anything captures the stream — e.g. running
+# this script through `script.ps1 2>&1 | Tee-Object log`, or any CI wrapper.
+# That turned a harmless "unused manifest key" cargo warning into a build
+# failure.  Run native commands with stderr merged and error promotion off,
+# then fail explicitly on a non-zero exit code.  Output is echoed to the host
+# and also returned, so callers may parse stdout.
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$Command,
+        [string]$What = "native command"
+    )
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $captured = @()
+    try {
+        $captured = & $Command 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    foreach ($line in $captured) { Write-Host $line }
+    if ($code -ne 0) {
+        throw "$What exited with code $code"
+    }
+    return $captured
+}
+
 # Version straight from Cargo.toml.
 $version = (Select-String -Path "$root\Cargo.toml" -Pattern '^version = "([^"]+)"' |
     Select-Object -First 1).Matches[0].Groups[1].Value
@@ -57,7 +87,7 @@ foreach ($exe in "lib", "dumpbin", "cl") {
 if (-not $SkipEngine) {
     Step "Building Rust engine (release)"
     Push-Location $root
-    cargo build --release
+    Invoke-Native { cargo build --release } "cargo build --release" | Out-Null
     Pop-Location
 }
 $engineExe = "$root\target\release\stream-live-translate.exe"
@@ -68,7 +98,7 @@ New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 $obsSrc = Join-Path $WorkDir "obs-studio"
 if (-not (Test-Path "$obsSrc\libobs\obs-module.h")) {
     Step "Fetching libobs headers (obs-studio $ObsVersion, shallow clone)"
-    git clone --depth 1 --branch $ObsVersion https://github.com/obsproject/obs-studio $obsSrc
+    Invoke-Native { git clone --depth 1 --branch $ObsVersion https://github.com/obsproject/obs-studio $obsSrc } "git clone obs-studio" | Out-Null
 }
 
 # --- 3. OBS SDK: obs.dll + import library ----------------------------------
@@ -104,25 +134,26 @@ $defFile = Join-Path $sdkBin "obs.def"
 $obsLib = Join-Path $sdkBin "obs.lib"
 if (-not (Test-Path $obsLib)) {
     Step "Generating import library obs.lib from obs.dll exports"
-    $exports = & dumpbin /exports $obsDll |
+    $exports = Invoke-Native { dumpbin /exports $obsDll } "dumpbin /exports" |
+        Where-Object { $_ -is [string] } |
         Where-Object { $_ -match '^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]+\s+(\S+)' } |
         ForEach-Object { $Matches[1] } |
         Where-Object { $_ -notmatch '^@' -and $_ -notmatch '\.dll$' } |
         Sort-Object -Unique
     if (-not $exports) { throw "dumpbin produced no exports; wrong obs.dll?" }
-    Set-Content -Path $defFile -Value (@("LIBRARY obs", "EXPORTS") + $exports)
-    & lib /nologo /machine:x64 "/def:$defFile" "/out:$obsLib" | Out-Null
+    Set-Content -Path $defFile -Value (@("LIBRARY obs", "EXPORTS") + $exports) -Encoding ASCII
+    Invoke-Native { lib /nologo /machine:x64 "/def:$defFile" "/out:$obsLib" } "lib /def" | Out-Null
     if (-not (Test-Path $obsLib)) { throw "failed to create obs.lib" }
 }
 
 # --- 4. Build the plugin ---------------------------------------------------
 Step "Building plugin (CMake/MSVC)"
 $pluginBuild = Join-Path $WorkDir "..\plugin-build-win"
-cmake -S "$root\plugin" -B $pluginBuild `
+Invoke-Native { cmake -S "$root\plugin" -B $pluginBuild `
     -DCMAKE_BUILD_TYPE=Release `
     "-DLIBOBS_INCLUDE_DIR=$obsSrc\libobs" `
-    "-DOBS_IMPORT_LIB=$obsLib"
-cmake --build $pluginBuild --config Release
+    "-DOBS_IMPORT_LIB=$obsLib" } "cmake configure" | Out-Null
+Invoke-Native { cmake --build $pluginBuild --config Release } "cmake --build" | Out-Null
 $dll = Get-ChildItem $pluginBuild -Recurse -Filter "stream-live-translate.dll" |
     Select-Object -First 1
 if (-not $dll) { throw "plugin dll not found" }
@@ -143,7 +174,33 @@ Copy-Item "$root\README.md" "$pkgRoot\README.md"
 New-Item -ItemType Directory -Force -Path "$root\release" | Out-Null
 $outZip = "$root\release\stream-live-translate-obs-win-x64-$version.zip"
 if (Test-Path $outZip) { Remove-Item $outZip -Force }
-Compress-Archive -Path "$pkgRoot" -DestinationPath $outZip
+# Compress-Archive on Windows PowerShell 5.1 stores entry names with backslash
+# separators ("stream-live-translate\bin\64bit\..."), which is not valid per the
+# ZIP spec (APPNOTE 4.4.17.1 mandates '/').  Windows Explorer tolerates it, but
+# `unzip` on Linux/macOS, 7-Zip listings and any automated manifest check end up
+# with one flat file whose name contains literal backslashes.  Write the archive
+# ourselves so entry names are conformant.
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+Add-Type -AssemblyName System.IO.Compression
+# Use the *resolved* parent path: $pkgRoot is built from $WorkDir, which still
+# contains a literal ".." segment, so its string length does not match the
+# fully-resolved paths Get-ChildItem returns.  Slicing entry names off the
+# unresolved string silently truncated the leading "stream-live-translate".
+$zipBase = (Get-Item -LiteralPath $pkgRoot).Parent.FullName
+$archive = [System.IO.Compression.ZipFile]::Open($outZip, [System.IO.Compression.ZipArchiveMode]::Create)
+try {
+    foreach ($file in (Get-ChildItem -LiteralPath $pkgRoot -Recurse -File | Sort-Object FullName)) {
+        if (-not $file.FullName.StartsWith($zipBase, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "refusing to archive $($file.FullName): outside $zipBase"
+        }
+        $entryName = $file.FullName.Substring($zipBase.Length + 1).Replace('\', '/')
+        [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+            $archive, $file.FullName, $entryName,
+            [System.IO.Compression.CompressionLevel]::Optimal)
+    }
+} finally {
+    $archive.Dispose()
+}
 $hash = (Get-FileHash $outZip -Algorithm SHA256).Hash
 Set-Content -Path "$outZip.sha256" -Value "$hash  $(Split-Path -Leaf $outZip)"
 

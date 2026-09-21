@@ -35,35 +35,65 @@ const FORMAT_I16_MONO: u32 = 0;
 /// One pipeline frame: 20 ms at 16 kHz.
 const FRAME_SAMPLES_16K: usize = 320;
 
-static SENDER: Mutex<Option<PcmSender>> = Mutex::new(None);
+/// Generation counter for the ingest registry.
+///
+/// Why a generation is needed: `try_start` calls `register()` (which installs
+/// the NEW pipeline's sender) *before* it stores the new `PipelineInner`, and
+/// storing that inner drops the OLD one — whose `_ingest_guard` used to clear
+/// `SENDER` unconditionally on drop. So the old guard wiped out the sender that
+/// had just been registered, and in `obs_filter` mode the new pipeline never
+/// received another frame: the first-frame gate timed out, the retry registered
+/// again and was wiped again, i.e. a permanent self-lock.
+///
+/// Every registration now carries the generation that was current when it was
+/// installed, and dropping it only clears the slot if that generation is still
+/// the active one.
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static SENDER: Mutex<Option<(u64, PcmSender)>> = Mutex::new(None);
 
-/// Guard returned by [`register`]; unregisters the sender when dropped.
+fn current_generation() -> u64 {
+    GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Retire the active registration without installing a new one. Bumping the
+/// generation is what makes any stale guard harmless afterwards.
+fn retire_current() {
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    *SENDER.lock() = None;
+}
+
+/// Guard returned by [`register`]; unregisters the sender when dropped, but only
+/// if no newer registration has replaced it in the meantime.
 pub struct Registration {
-    _private: (),
+    generation: u64,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        *SENDER.lock() = None;
+        let mut slot = SENDER.lock();
+        if slot.as_ref().is_some_and(|(g, _)| *g == self.generation) {
+            *slot = None;
+        }
     }
 }
 
 /// Register the raw-PCM sender of the currently active pipeline so ingest
 /// connections can feed frames into it.
 pub fn register(tx: PcmSender) -> Registration {
-    *SENDER.lock() = Some(tx);
-    Registration { _private: () }
+    let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    *SENDER.lock() = Some((generation, tx));
+    Registration { generation }
 }
 
 /// End the current finite input. This is used when a replay sender closes its
 /// TCP stream: dropping the last raw sender lets the VAD and provider writer
 /// finish normally instead of leaving a live websocket waiting forever.
 fn close_input() {
-    *SENDER.lock() = None;
+    retire_current();
 }
 
 fn try_send_frame(frame: Vec<i16>) {
-    if let Some(tx) = SENDER.lock().as_ref() {
+    if let Some((_, tx)) = SENDER.lock().as_ref() {
         // Best-effort send; drop on backpressure (same policy as cpal path).
         let _ = tx.try_send(frame);
     }
@@ -230,4 +260,81 @@ async fn pump_audio(
         sample_buf.extend_from_slice(&tail_samples);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    /// The registry is process-global, so these tests must not interleave: one
+    /// test's `retire_current()` would otherwise invalidate another's guard.
+    static REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
+        REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn sender() -> (PcmSender, mpsc::Receiver<Vec<i16>>) {
+        mpsc::channel::<Vec<i16>>(8)
+    }
+
+    /// The exact self-lock that made `obs_filter` pipelines go deaf:
+    /// `try_start` registers the NEW sender, then drops the OLD `PipelineInner`
+    /// (and with it the old guard). If the old guard clears the slot
+    /// unconditionally, the new pipeline never receives another frame.
+    #[test]
+    fn dropping_a_stale_guard_keeps_the_new_registration() {
+        let _serial = registry_guard();
+        retire_current(); // start from a clean slate
+        let (old_tx, _old_rx) = sender();
+        let old_guard = register(old_tx);
+
+        let (new_tx, mut new_rx) = sender();
+        let _new_guard = register(new_tx);
+
+        // The old pipeline is torn down after the new one registered.
+        drop(old_guard);
+
+        try_send_frame(vec![1, 2, 3]);
+        assert!(
+            new_rx.try_recv().is_ok(),
+            "the new pipeline must still receive frames after the old guard is dropped"
+        );
+    }
+
+    #[test]
+    fn the_current_guard_still_unregisters() {
+        let _serial = registry_guard();
+        retire_current();
+        let (tx, mut rx) = sender();
+        let guard = register(tx);
+        try_send_frame(vec![7]);
+        assert!(rx.try_recv().is_ok(), "registered sender receives frames");
+
+        drop(guard);
+        try_send_frame(vec![8]);
+        assert!(
+            rx.try_recv().is_err(),
+            "dropping the active guard must stop delivery"
+        );
+    }
+
+    /// A finite replay ends by retiring the active input, which must also
+    /// invalidate any guard that is still alive at that moment.
+    #[test]
+    fn retiring_the_input_invalidates_an_outstanding_guard() {
+        let _serial = registry_guard();
+        retire_current();
+        let (tx, mut rx) = sender();
+        let guard = register(tx);
+        close_input();
+        try_send_frame(vec![9]);
+        assert!(rx.try_recv().is_err(), "retired input must not deliver");
+
+        // The stale guard must not resurrect anything when it finally drops.
+        drop(guard);
+        try_send_frame(vec![10]);
+        assert!(rx.try_recv().is_err(), "stale guard drop must not re-register");
+    }
 }

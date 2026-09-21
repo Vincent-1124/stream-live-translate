@@ -128,11 +128,13 @@ async fn run_loop(state: Arc<AppState>, client: Arc<Mutex<ObsClient>>) {
             continue;
         }
         if let Err(e) = try_connect(&state, &cfg, &client).await {
-            warn!(error = %e, "OBS WebSocket connect failed");
+            // Full cause chain, so the admin panel and the log both show why
+            // (DNS, refused, bad password) instead of just the outer context.
+            warn!(error = %format!("{e:#}"), "OBS WebSocket connect failed");
             {
                 let mut s = state.status.write();
                 s.obs_connected = false;
-                s.obs_error = Some(e.to_string());
+                s.obs_error = Some(format!("{e:#}"));
             }
             client.lock().status.lock().connected = false;
             client.lock().status.lock().last_error = Some(e.to_string());

@@ -113,8 +113,26 @@
       </label>
     </section>
 
+    <section class="card" id="hotword-card">
+      <h2>2. 热词（提升专名识别）</h2>
+      <p class="hint">
+        走阿里云百炼官方「上下文增强」下发，仅 <code>bailian-fun-asr</code> 生效。
+        <strong>必须写音频里会出现的原词</strong>（如「铨洲智造」），只写"赞助商名称"这类描述无效。
+      </p>
+      <label>
+        <span>热词列表（每行一个，或用逗号/分号分隔）</span>
+        <textarea id="hotwords" rows="5" placeholder="铨洲智造&#10;区域赛&#10;Bulge Bracket"></textarea>
+      </label>
+      <p class="hint">
+        规范：含中文等非 ASCII 字符的单条 ≤ 15 字符；纯英文按空格 ≤ 7 个片段；
+        每轮上下文 ≤ 400 字符（超出自动分轮），服务端只保留最近 5 轮。
+      </p>
+      <div id="hotword-warnings" class="engine-error" hidden></div>
+      <p class="hint" id="hotword-status-text">热词状态：读取中…</p>
+    </section>
+
     <section class="card">
-      <h2>2. 音频输入</h2>
+      <h2>3. 音频输入</h2>
       <p class="hint">系统音频环回 = 抓取 OBS 当前听到的声音；麦克风 = 抓指定输入设备。</p>
       <label>
         <span>模式</span>
@@ -133,17 +151,24 @@
         <span>输入音量</span>
         <div class="meter-track" role="meter" aria-label="输入音量" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="input-level-bar"></i></div>
         <b id="input-level-text">未检测到声音</b>
+        <small class="meter-rms" id="input-level-rms">RMS —（VAD 前原始值，每 1 秒刷新）</small>
       </div>
       <button id="audio-test-btn" class="btn ghost" type="button">开始 13 秒试音</button>
-      <p class="hint">点击后先保持 3 秒安静，再正常讲话并包含轻声约 10 秒；结果只用于提示，不会保存或上传音频。</p>
+      <p class="hint" id="audio-test-hint">点击后先保持 3 秒安静，再正常讲话并包含轻声约 10 秒；结果只用于提示，不会保存或上传音频。</p>
       <label>
         <span>人声过滤预设</span>
         <select id="filter-preset">
           <option value="soft">保留轻声</option>
           <option value="balanced" selected>平衡</option>
           <option value="strong">强过滤</option>
+          <option value="custom">自定义（使用下方静音阈值）</option>
         </select>
         <small class="field-status">预设是起点；请用实际无线麦克风试音后再确认。</small>
+      </label>
+      <label>
+        <span>静音阈值 silence_rms</span>
+        <input id="silence-rms" type="number" min="0" max="1" step="0.001" value="0.012" />
+        <small class="field-status">低于该 RMS 的帧判为静音。请对照上方实时 RMS 读数设置：安静时略高于背景、明显低于轻声。</small>
       </label>
       <label class="row">
         <input id="use_sck" type="checkbox" />
@@ -152,7 +177,7 @@
     </section>
 
     <section class="card">
-      <h2>3. OBS 集成</h2>
+      <h2>4. OBS 集成</h2>
       <p class="hint">插件自动连接本机 OBS（obs-websocket v5），可把字幕同步写入一个"Subtitles"文本源。</p>
       <label class="row">
         <input id="obs-auto" type="checkbox" />
@@ -178,7 +203,7 @@
     </section>
 
     <section class="card">
-      <h2>4. 字幕样式</h2>
+      <h2>5. 字幕样式</h2>
       <p class="hint">保存后 OBS 字幕<b>立即生效</b>，无需重新复制下方 URL。</p>
       <label>
         <span>字体大小 (px)</span>
@@ -195,6 +220,17 @@
           <option value="750" selected>0.75 秒</option>
           <option value="1000">1 秒</option>
         </select>
+      </label>
+      <label>
+        <span>无新内容后清屏</span>
+        <select id="ov-clear-after">
+          <option value="2000">2 秒</option>
+          <option value="3000">3 秒</option>
+          <option value="4000" selected>4 秒</option>
+          <option value="6000">6 秒</option>
+          <option value="8000">8 秒</option>
+        </select>
+        <small class="field-status">最后一条字幕事件之后，经过该时长自动清屏并重置当前页缓冲。</small>
       </label>
       <label>
         <span>背景宽度 / 高度（px，0=自动）</span>
@@ -243,10 +279,12 @@
           <option value="slide">滑入</option>
         </select>
       </label>
+      <button id="perf-mode-btn" class="btn ghost guide-btn" type="button" aria-pressed="false">性能模式：关</button>
+      <small class="field-status">开启后关闭字幕背景模糊（backdrop-filter）。集显或掉帧时建议开启；OBS 浏览器源会实时跟随，无需重载。</small>
     </section>
 
     <section class="card wide">
-      <h2>5. 实时字幕预览</h2>
+      <h2>6. 实时字幕预览</h2>
       <div class="preview">
         <div id="preview-stage" class="preview-stage position-bottom">
           <div id="preview-caption" class="preview-caption empty">
@@ -258,6 +296,7 @@
         <button id="save-btn" class="btn primary" type="button">保存配置</button>
         <button id="connection-test-btn" class="btn ghost" type="button">测试已保存的连接</button>
         <button id="restart-btn" class="btn ghost" type="button">重启管线</button>
+        <button id="stop-btn" class="btn ghost" type="button">停止管线</button>
         <button id="clear-btn" class="btn ghost" type="button">清空字幕</button>
         <span id="save-status" class="status"></span>
       </div>
@@ -273,7 +312,7 @@
     </section>
 
     <section class="card wide">
-      <h2>6. 翻译结果历史</h2>
+      <h2>7. 翻译结果历史</h2>
       <div class="history-actions">
         <label class="btn ghost file-btn">
           <span>📂 导入字幕文件</span>

@@ -132,6 +132,110 @@
     "mock": "mock"
   };
 
+  // ---- 热词（R10）--------------------------------------------------------
+  // 官方约束（与 src/hotwords.rs 保持一致）：每轮上下文 ≤ 400 字符，服务端只
+  // 保留最近 5 轮；词形规范：含非 ASCII 的单词 ≤ 15 字符，纯 ASCII ≤ 7 个空格片段。
+  // 生效机制是**词表匹配**，所以这里写的必须是音频里会出现的原词。
+  const HOTWORD_ROUND_MAX = 400;
+  const HOTWORD_ROUNDS_MAX = 5;
+  const HOTWORD_NON_ASCII_MAX = 15;
+  const HOTWORD_ASCII_SEGMENTS_MAX = 7;
+
+  /// 解析输入框：一行一个，也接受逗号/分号/顿号分隔；去空去重保持顺序。
+  function parseHotwords(raw) {
+    const out = [];
+    String(raw || "")
+      .split(/[\n\r,;、]+/)
+      .forEach((piece) => {
+        const word = piece.trim();
+        if (word && out.indexOf(word) === -1) out.push(word);
+      });
+    return out;
+  }
+
+  /// 与服务端同一套切分：先体检，再按 400 字符/轮切，只留最近 5 轮。
+  function planHotwords(words) {
+    const warnings = [];
+    words.forEach((word) => {
+      const chars = Array.from(word).length;
+      if (/^[\x00-\x7F]*$/.test(word)) {
+        const segments = word.split(/\s+/).filter(Boolean).length;
+        if (segments > HOTWORD_ASCII_SEGMENTS_MAX) {
+          warnings.push(`「${word}」按空格切分有 ${segments} 个片段，规范上限 ${HOTWORD_ASCII_SEGMENTS_MAX} 个`);
+        }
+      } else if (chars > HOTWORD_NON_ASCII_MAX) {
+        warnings.push(`「${word}」共 ${chars} 字符，含非 ASCII 的单词规范上限 ${HOTWORD_NON_ASCII_MAX} 个`);
+      }
+    });
+    const rounds = [];
+    let current = "";
+    words.forEach((word) => {
+      const candidate = current ? current + " " + word : word;
+      if (Array.from(candidate).length <= HOTWORD_ROUND_MAX) {
+        current = candidate;
+        return;
+      }
+      if (current) {
+        rounds.push(current);
+        current = "";
+      }
+      const chars = Array.from(word).length;
+      if (chars > HOTWORD_ROUND_MAX) {
+        // 与服务端一致：单条超长的词截断后仍会下发，不会静默丢掉。
+        rounds.push(Array.from(word).slice(0, HOTWORD_ROUND_MAX).join(""));
+        warnings.push(`「${word}」超过每轮 ${HOTWORD_ROUND_MAX} 字符，已截断后才下发`);
+      } else {
+        current = word;
+      }
+    });
+    if (current) rounds.push(current);
+    const dropped = Math.max(0, rounds.length - HOTWORD_ROUNDS_MAX);
+    if (dropped > 0) {
+      warnings.push(`词表需要 ${rounds.length} 轮，服务端只保留最近 ${HOTWORD_ROUNDS_MAX} 轮，最早 ${dropped} 轮不会生效（请精简热词）`);
+    }
+    return { words, rounds: rounds.slice(dropped), dropped, warnings };
+  }
+
+  /// 编辑框实时校验：违规词给出可见警告，并显示分轮数量。
+  function renderHotwordWarnings() {
+    const box = $("hotword-warnings");
+    if (!box) return null;
+    const plan = planHotwords(parseHotwords($("hotwords").value));
+    const providerBailian = $("provider-type").value === "bailian";
+    const lines = plan.warnings.slice();
+    if (!providerBailian) {
+      lines.push("当前大模型通道不支持热词：请把「服务商」切到百炼 Fun-ASR 实时。");
+    }
+    if (plan.words.length && providerBailian) {
+      lines.push(`共 ${plan.words.length} 个热词，将分 ${plan.rounds.length} 轮下发（每轮 ≤ ${HOTWORD_ROUND_MAX} 字符）。`);
+    }
+    box.textContent = lines.join("\n");
+    box.hidden = lines.length === 0;
+    box.classList.toggle("good", false);
+    return plan;
+  }
+
+  /// 显示热词是否已生效：来自由 /api/config 与 /api/status 的 hotword_status。
+  function renderHotwordStatus(hs) {
+    const el = $("hotword-status-text");
+    if (!el || !hs) return;
+    if (!hs.count) {
+      el.textContent = "热词状态：未配置热词（不携带上下文，行为与旧版本一致）";
+      el.className = "hint dim";
+      return;
+    }
+    const when = hs.last_applied_at ? new Date(hs.last_applied_at).toLocaleTimeString() : "—";
+    const parts = [];
+    parts.push(hs.delivered ? `已下发 ${hs.delivered_count} 个热词` : "尚未下发（等待会话启动）");
+    if (hs.delivered) parts.push(`方式 ${hs.mode || "—"} / ${hs.delivered_rounds} 轮`);
+    parts.push(`上次生效 ${when}`);
+    parts.push(`未变化未重发 ${hs.skipped_unchanged || 0} 次`);
+    if (hs.delivered_dropped_rounds) parts.push(`⚠ 因超出 5 轮被丢弃 ${hs.delivered_dropped_rounds} 轮`);
+    if (hs.last_result) parts.push(hs.last_result);
+    el.textContent = "热词状态：" + parts.join("　|　");
+    el.className = "hint " + (hs.delivered ? "ok" : "warn");
+  }
+
   // ---- 状态 -------------------------------------------------------------
   let currentConfig = null;
   let pendingPartial = "";
@@ -143,6 +247,45 @@
   let wsReconnectDelay = 1500;
   let localImportedRows = []; // 用户从文件导入的历史
   let lastServerHistory = []; // 服务端的历史
+  let lastInputLevel = 0;     // 最近一次 /api/status 的 VAD 前 RMS
+  let statusPollTimer = null; // /api/status 轮询句柄
+  let audioTestQuietMs = 3000;   // 引导试音的安静段（服务端 [audio_test] 值）
+  let audioTestSpeechMs = 10000; // 引导试音的讲话段
+
+  // ---- 性能模式 ---------------------------------------------------------
+  // Shared with the overlay through localStorage (same origin). The overlay
+  // reads this key on load and reacts to `storage` events, so toggling here
+  // changes the OBS browser source without reloading it.
+  const PERF_MODE_KEY = "slt.perfMode";
+
+  function perfModeOn() {
+    try {
+      return localStorage.getItem(PERF_MODE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  }
+
+  /// Reflect the stored switch in the button without writing it back.
+  function renderPerfModeButton() {
+    const btn = $("perf-mode-btn");
+    if (!btn) return;
+    const on = perfModeOn();
+    btn.textContent = "性能模式：" + (on ? "开" : "关");
+    btn.setAttribute("aria-pressed", on ? "true" : "false");
+    btn.classList.toggle("primary", on);
+  }
+
+  function applyPerfMode(on) {
+    try {
+      localStorage.setItem(PERF_MODE_KEY, on ? "1" : "0");
+    } catch {
+      toast("浏览器禁用了本地存储，无法保存性能模式", "error");
+      return;
+    }
+    renderPerfModeButton();
+    toast(on ? "性能模式已开启（字幕背景模糊已关闭）" : "性能模式已关闭", "ok");
+  }
 
   // ---- OBS dock detection -----------------------------------------------
   if (new URLSearchParams(location.search).get("obsDock") === "1") {
@@ -212,7 +355,9 @@
     modeSel.value = cfg.audio.mode;
     $("use_sck").checked = !!cfg.audio.use_screen_capture_kit;
     const rms = Number(cfg.filter && cfg.filter.silence_rms);
-    $("filter-preset").value = rms <= 0.008 ? "soft" : rms >= 0.018 ? "strong" : "balanced";
+    const rmsValue = isFinite(rms) && rms > 0 ? rms : 0.012;
+    $("silence-rms").value = String(rmsValue);
+    $("filter-preset").value = presetForRms(rmsValue);
 
     // OBS
     $("obs-auto").checked = !!cfg.obs.auto_connect;
@@ -225,6 +370,7 @@
     $("ov-size").value = cfg.overlay.font_size || 48;
     $("ov-max-lines").value = cfg.overlay.max_lines || 2;
     $("ov-display-delay").value = cfg.overlay.display_delay_ms || 750;
+    $("ov-clear-after").value = cfg.overlay.clear_after_ms || 4000;
     $("ov-bg-width").value = cfg.overlay.bg_width || 0;
     $("ov-bg-height").value = cfg.overlay.bg_height || 0;
     $("ov-border-radius").value = cfg.overlay.border_radius || 8;
@@ -237,6 +383,16 @@
     $("ov-animation").value = cfg.overlay.animation || "typewriter";
 
     $("obs-dock-url").textContent = `${location.protocol}//${location.host}/admin?obsDock=1`;
+
+    // 热词（R10）：来自配置的多行文本 + 服务端给出的分发/生效状态。
+    const hw = $("hotwords");
+    if (hw) {
+      const list = Array.isArray(cfg.llm.hotwords) ? cfg.llm.hotwords : [];
+      // 只在该字段未被用户改动时回填，避免轮询/保存把正在编辑的内容覆盖掉。
+      if (document.activeElement !== hw) hw.value = list.join("\n");
+      renderHotwordWarnings();
+    }
+    renderHotwordStatus(cfg.hotword_status);
 
     updateProviderUI();
     applyPreviewStyles();
@@ -258,6 +414,7 @@
         transcribe: $("transcribe").checked,
         transcription_model: $("transcription_model").value.trim(),
         gateway_text: $("gateway_text").checked,
+        hotwords: parseHotwords($("hotwords") ? $("hotwords").value : ""),
       },
       audio: {
         mode: $("audio-mode").value,
@@ -276,6 +433,7 @@
         font_size: parseInt($("ov-size").value, 10) || 48,
         max_lines: Math.min(2, Math.max(1, parseInt($("ov-max-lines").value, 10) || 2)),
         display_delay_ms: Math.min(1000, Math.max(500, parseInt($("ov-display-delay").value, 10) || 750)),
+        clear_after_ms: Math.min(15000, Math.max(1000, parseInt($("ov-clear-after").value, 10) || 4000)),
         bg_width: Math.max(0, parseInt($("ov-bg-width").value, 10) || 0),
         bg_height: Math.max(0, parseInt($("ov-bg-height").value, 10) || 0),
         border_radius: Math.max(0, parseInt($("ov-border-radius").value, 10) || 0),
@@ -288,12 +446,27 @@
     };
   }
 
+  const PRESET_RMS = { soft: 0.007, balanced: 0.012, strong: 0.020 };
+
+  function presetForRms(rms) {
+    for (const [name, value] of Object.entries(PRESET_RMS)) {
+      if (Math.abs(rms - value) < 1e-9) return name;
+    }
+    return "custom";
+  }
+
   function filterPresetPatch() {
     const preset = $("filter-preset").value;
-    // These are conservative starting values, not claimed microphone calibration.
-    if (preset === "soft") return { silence_rms: 0.007 };
-    if (preset === "strong") return { silence_rms: 0.020 };
-    return { silence_rms: 0.012 };
+    // "自定义" reads the numeric field so a threshold typed by hand is saved
+    // verbatim instead of being snapped back to a preset value.
+    if (preset === "custom") {
+      const typed = Number($("silence-rms").value);
+      return { silence_rms: isFinite(typed) && typed >= 0 ? typed : 0.012 };
+    }
+    const value = preset === "soft" ? 0.007 : preset === "strong" ? 0.020 : 0.012;
+    // Keep the numeric field in step for the next round-trip.
+    $("silence-rms").value = String(value);
+    return { silence_rms: value };
   }
 
   function updateProviderUI() {
@@ -327,6 +500,10 @@
     $("gateway_row").style.display = providerType === "local" ? "" : "none";
     $("workspace-row").style.display = isBailian ? "" : "none";
     $("low_latency_ms_row").style.display = $("low_latency").checked ? "" : "none";
+    // 热词走百炼上下文增强，只有 bailian-fun-asr 支持；其它通道提示不支持。
+    const hwCard = $("hotword-card");
+    if (hwCard) hwCard.classList.toggle("locked", !isBailian);
+    renderHotwordWarnings();
   }
 
   // ---- 预览样式 --------------------------------------------------------
@@ -618,56 +795,136 @@
     }
   }
 
+  const STATUS_POLL_MS = 1000;
+
+  /// Live RMS readout next to the meter.  The bar is a coarse power curve; this
+  /// number is the raw pre-VAD RMS of the newest captured frame, which is what
+  /// microphone calibration and the silence threshold are compared against.
+  function updateRmsReadout(level) {
+    const el = $("input-level-rms");
+    if (!el) return;
+    const rmsText = level < 0.0005 ? "0.00000" : level.toFixed(5);
+    const sel = $("filter-preset");
+    const preset = sel ? sel.value : "";
+    const presetLabel = { soft: "保留轻声", balanced: "平衡", strong: "强过滤" }[preset] || "自定义";
+    const threshold = num("silence-rms", 0.012);
+    const margin = threshold > 0 && level > 0
+      ? (level >= threshold ? "高于阈值" : "低于阈值")
+      : "";
+    el.textContent =
+      `RMS（VAD 前）${rmsText}　静音阈值 ${threshold}${margin ? "（当前" + margin + "）" : ""}　预设 ${presetLabel}`;
+  }
+
+  /// Replace the whole readout whenever the silence threshold is edited, so the
+  /// number does not look stale while audio is paused.
+  function refreshRmsReadout() {
+    updateRmsReadout(lastInputLevel);
+  }
+
+  /// Keep the试音 button and its hint in step with the configured durations.
+  /// Safe to call on every status poll: the DOM is only touched when the text
+  /// actually changes, so the 1 s poll cannot cause layout churn.
+  function renderAudioTestLabels() {
+    const secs = (ms) => (ms / 1000).toFixed(ms % 1000 === 0 ? 0 : 1);
+    const btn = $("audio-test-btn");
+    if (btn) {
+      const label = `开始 ${secs(audioTestQuietMs + audioTestSpeechMs)} 秒试音`;
+      if (btn.textContent !== label) btn.textContent = label;
+    }
+    const hint = $("audio-test-hint");
+    if (hint) {
+      const text =
+        `点击后先保持安静 ${secs(audioTestQuietMs)} 秒，` +
+        `再正常讲话并包含轻声约 ${secs(audioTestSpeechMs)} 秒；` +
+        `结果只用于提示，不会保存或上传音频。`;
+      if (hint.textContent !== text) hint.textContent = text;
+    }
+  }
+
   async function loadStatus() {
     try {
       const s = await apiGet("/api/status");
       const set = (id, ok, warn) => {
         const el = $(id);
+        if (!el) return;
         el.classList.remove("ok", "bad", "warn");
         el.classList.add(ok ? "ok" : warn ? "warn" : "bad");
       };
       set("dot-audio", !!s.audio_active, false);
       const level = Math.max(0, Math.min(1, Number(s.input_level) || 0));
+      // The bar uses a mild power curve so the everyday 0.005–0.05 range stays
+      // visible; the exact RMS number below it is what calibration reads.
       const percent = Math.round(Math.sqrt(level) * 100);
       const meter = $("input-level-bar");
-      meter.style.width = percent + "%";
-      meter.parentElement.setAttribute("aria-valuenow", String(percent));
-      $("input-level-text").textContent = percent < 2 ? "未检测到声音" : `${percent}%`;
+      if (meter) {
+        meter.style.width = percent + "%";
+        const track = meter.parentElement;
+        if (track) track.setAttribute("aria-valuenow", String(percent));
+      }
+      const levelText = $("input-level-text");
+      if (levelText) levelText.textContent = percent < 2 ? "未检测到声音" : `${percent}%`;
+      lastInputLevel = level;
+      updateRmsReadout(level);
+      // Guided-test timings come from the server so the button label, the
+      // instruction text and the local countdown all match the real run.
+      if (isFinite(Number(s.audio_test_quiet_ms))) audioTestQuietMs = Number(s.audio_test_quiet_ms);
+      if (isFinite(Number(s.audio_test_speech_ms))) audioTestSpeechMs = Number(s.audio_test_speech_ms);
+      renderAudioTestLabels();
       set("dot-llm", !!s.llm_connected, s.running && !s.last_error ? true : false);
       set("dot-obs", !!s.obs_connected, false);
+      // 热词是否真的下发成功，只有 /api/status 知道（provider 会话开始/更新后写）。
+      renderHotwordStatus(s.hotwords);
       const run = $("run-state");
-      if (s.running) { run.textContent = "● 管线运行中"; run.className = "run-state ok"; }
-      else            { run.textContent = "● 管线未运行"; run.className = "run-state bad"; }
+      if (run) {
+        if (s.running) { run.textContent = "● 管线运行中"; run.className = "run-state ok"; }
+        else           { run.textContent = "● 管线未运行"; run.className = "run-state bad"; }
+      }
 
       const errEl = $("engine-error");
-      errEl.classList.remove("good");
-      if (s.last_error) {
-        errEl.textContent = "❗ " + s.last_error;
-        errEl.hidden = false;
-      } else if (!s.obs_connected && s.obs_error) {
-        errEl.textContent = "⚠️ OBS 未连接：" + s.obs_error + "（请确认 OBS 已启动，且 工具 → WebSocket 服务器设置 已开启）";
-        errEl.hidden = false;
-      } else if (s.running) {
-        errEl.textContent = "✅ 管线运行中";
-        errEl.hidden = false;
-        errEl.classList.add("good");
-      } else {
-        errEl.hidden = true;
+      if (errEl) {
+        errEl.classList.remove("good");
+        if (s.last_error) {
+          errEl.textContent = "❗ " + s.last_error;
+          errEl.hidden = false;
+        } else if (!s.obs_connected && s.obs_error) {
+          errEl.textContent = "⚠️ OBS 未连接：" + s.obs_error + "（请确认 OBS 已启动，且 工具 → WebSocket 服务器设置 已开启）";
+          errEl.hidden = false;
+        } else if (s.running) {
+          errEl.textContent = "✅ 管线运行中";
+          errEl.hidden = false;
+          errEl.classList.add("good");
+        } else {
+          errEl.hidden = true;
+        }
       }
       if (s.config_path) {
-        $("config-path").textContent = "配置文件：" + s.config_path;
+        const cp = $("config-path");
+        if (cp) cp.textContent = "配置文件：" + s.config_path;
       }
       const lock = $("audio-mode-lock");
+      const modeSel = $("audio-mode");
       if (s.audio_mode_forced) {
-        $("audio-mode").disabled = true;
-        lock.hidden = false;
+        if (modeSel) modeSel.disabled = true;
+        if (lock) lock.hidden = false;
       } else {
-        $("audio-mode").disabled = false;
-        lock.hidden = true;
+        if (modeSel) modeSel.disabled = false;
+        if (lock) lock.hidden = true;
       }
     } catch (e) {
       console.warn("load status failed", e);
     }
+  }
+
+  /// Poll /api/status so the level meter and the RMS readout track the live
+  /// input instead of freezing at whatever the value was when the page opened.
+  /// Paused in hidden tabs, and the first request is deferred so the immediate
+  /// boot-time load is not duplicated.
+  function startStatusPolling() {
+    if (statusPollTimer) return;
+    statusPollTimer = setInterval(() => {
+      if (document.hidden) return;
+      loadStatus();
+    }, STATUS_POLL_MS);
   }
 
   async function loadHistory() {
@@ -717,8 +974,15 @@
       } else if (p.type === "partial") {
         const text = (p.text || "").trim();
         if (text) {
-          pendingPartial = (pendingPartial || "") + text;
-          setPreviewText(pendingPartial, true);
+          if (p.replace === true) {
+            // Cumulative revision (e.g. Bailian): the payload is the whole
+            // still-open sentence, so appending would duplicate it. The
+            // overlay already honours this flag; the preview must match.
+            pendingPartial = text;
+          } else {
+            pendingPartial = (pendingPartial || "") + text;
+          }
+          setPreviewText(pendingPartial, false);
           $("preview-caption").classList.remove("empty");
         }
       } else if (p.type === "final") {
@@ -754,6 +1018,15 @@
     $("provider-type").addEventListener("change", updateProviderUI);
     $("low_latency").addEventListener("change", updateProviderUI);
     $("transcribe").addEventListener("change", updateProviderUI);
+    // 热词编辑时实时校验（含 400 字符分轮与词形规范告警）。
+    const hwBox = $("hotwords");
+    if (hwBox) {
+      let hwTimer = null;
+      hwBox.addEventListener("input", () => {
+        if (hwTimer) clearTimeout(hwTimer);
+        hwTimer = setTimeout(renderHotwordWarnings, 150);
+      });
+    }
 
     $("model-guide-btn").addEventListener("click", () => {
       const modal = $("guide-modal");
@@ -815,6 +1088,12 @@
         toast("Base URL 不正确：DashScope Realtime 需要 WebSocket 地址（wss://...）", "error");
         return;
       }
+      // 热词（R10）：违规词给可见警告，但不阻断保存——规范是"建议"，
+      // 硬拦会让用户没法保存其它设置。用户看到 ⚠️ 后自行决定是否改。
+      const hotwordPlan = renderHotwordWarnings();
+      if (hotwordPlan && hotwordPlan.warnings.length) {
+        toast(`⚠️ 热词有 ${hotwordPlan.warnings.length} 条规范提醒，仍会保存并下发`, "info");
+      }
       if (providerType === "online" && patch.llm.endpoint && !/^wss?:/i.test(patch.llm.endpoint)) {
         toast("Base URL 必须是 WebSocket 地址（wss:// 开头）", "error");
         return;
@@ -864,15 +1143,37 @@
 
     $("clear-key-btn").addEventListener("click", async () => {
       const btn = $("clear-key-btn");
+      const status = $("save-status");
       btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "清除中…";
       try {
-        await apiPost("/api/config/clear-key");
+        const result = await apiPost("/api/config/clear-key");
+        // The server verifies the on-disk file before it drops the in-memory
+        // key, so {ok:true} is the only acceptable answer here. Treating a
+        // missing/negative ok as success would leave the user believing the
+        // key is gone while it is still in config.toml.
+        if (!result || result.ok !== true) {
+          throw new Error(result && result.error ? result.error : "服务器未确认清除结果");
+        }
         await loadConfig();
-        toast("已清除保存的 API Key", "ok");
+        const stillSet = !!(currentConfig && currentConfig.llm && currentConfig.llm.api_key_set);
+        if (stillSet) {
+          status.textContent = "⚠ 清除后仍显示已设置，请检查 config.toml";
+          status.className = "status err";
+          toast("⚠️ 清除后 Key 仍为已设置状态，请检查 config.toml", "error");
+        } else {
+          status.textContent = "✓ 已清除保存的 Key";
+          status.className = "status ok";
+          toast("已清除保存的 API Key", "ok");
+        }
       } catch (e) {
+        status.textContent = "✗ 清除 Key 失败：" + (e.message || e);
+        status.className = "status err";
         toast("清除 Key 失败：" + (e.message || e), "error");
       } finally {
         btn.disabled = false;
+        btn.textContent = original;
       }
     });
 
@@ -904,17 +1205,42 @@
       const status = $("save-status");
       btn.disabled = true;
       const original = btn.textContent;
-      btn.textContent = "试音中…";
-      status.textContent = "请先保持安静 3 秒，然后正常讲话并包含轻声…";
+      const quietMs = audioTestQuietMs;
+      const speechMs = audioTestSpeechMs;
+      const seconds = (ms) => (ms / 1000).toFixed(ms % 1000 === 0 ? 0 : 1);
+      // The server samples the quiet window first, so drive the instruction
+      // from a local countdown instead of one frozen line of text: the user
+      // needs to know which phase is running right now.
+      const phaseStart = Date.now();
+      const renderPhase = () => {
+        const elapsed = Date.now() - phaseStart;
+        if (elapsed < quietMs) {
+          const left = Math.ceil((quietMs - elapsed) / 1000);
+          btn.textContent = `安静 ${left}s…`;
+          status.textContent = `请保持安静（还有 ${left} 秒），随后 ${seconds(speechMs)} 秒正常讲话并包含轻声…`;
+        } else {
+          const left = Math.ceil((quietMs + speechMs - elapsed) / 1000);
+          btn.textContent = `讲话 ${left}s…`;
+          status.textContent = `现在请正常讲话并包含轻声（还有 ${left} 秒）…`;
+        }
+      };
+      renderPhase();
+      const phaseTimer = setInterval(renderPhase, 250);
       status.className = "status";
       try {
         const result = await apiPost("/api/audio-test");
-        status.textContent = "✓ " + result.message;
+        const quiet = Number(result.quiet_rms);
+        const speech = Number(result.speech_rms);
+        const numbers = isFinite(quiet) && isFinite(speech)
+          ? `（背景 RMS ${quiet.toFixed(5)} / 讲话 RMS ${speech.toFixed(5)}）`
+          : "";
+        status.textContent = "✓ " + result.message + numbers;
         status.className = "status ok";
       } catch (e) {
         status.textContent = "✗ " + (e.message || e);
         status.className = "status err";
       } finally {
+        clearInterval(phaseTimer);
         btn.disabled = false;
         btn.textContent = original;
       }
@@ -931,6 +1257,25 @@
         setTimeout(loadStatus, 500);
       } catch (e) {
         toast("重启失败：" + (e.message || e), "error");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    });
+
+    // A real stop: it must survive the run loop's own restart path, otherwise
+    // "停" would be undone a moment later and the button would look broken.
+    $("stop-btn").addEventListener("click", async () => {
+      const btn = $("stop-btn");
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = "停止中…";
+      try {
+        await apiPost("/api/stop");
+        toast("已停止管线（点击「重启管线」可重新启动）", "ok");
+        setTimeout(loadStatus, 300);
+      } catch (e) {
+        toast("停止失败：" + (e.message || e), "error");
       } finally {
         btn.disabled = false;
         btn.textContent = orig;
@@ -954,17 +1299,48 @@
       renderHistory();
       toast("已清空本地历史", "ok");
     });
+
+    // Choosing a preset fills the numeric threshold so the two controls never
+    // disagree about what will be saved.
+    $("filter-preset").addEventListener("change", () => {
+      const preset = $("filter-preset").value;
+      if (preset !== "custom" && PRESET_RMS[preset] !== undefined) {
+        $("silence-rms").value = String(PRESET_RMS[preset]);
+      }
+      refreshRmsReadout();
+    });
+
+    // The numeric threshold can be typed directly; keep the preset select and
+    // the live readout honest about what the value now means.
+    $("silence-rms").addEventListener("input", () => {
+      const typed = Number($("silence-rms").value);
+      if (isFinite(typed)) $("filter-preset").value = presetForRms(typed);
+      refreshRmsReadout();
+    });
+
+    const perfBtn = $("perf-mode-btn");
+    if (perfBtn) {
+      perfBtn.addEventListener("click", () => {
+        applyPerfMode(!perfModeOn());
+      });
+      // Another tab (or an older overlay) may flip the same switch.
+      window.addEventListener("storage", (ev) => {
+        if (ev.key === PERF_MODE_KEY) applyPerfMode(ev.newValue === "1");
+      });
+    }
   }
 
   // ---- 启动 ------------------------------------------------------------
   async function boot() {
     try {
       bindEvents();
+      renderPerfModeButton();
       setupFileImport();
       await loadConfig();
       await loadDevices();
       await loadRecordingInfo();
       loadStatus();
+      startStatusPolling();
       loadHistory();
       connectWS();
     } catch (e) {

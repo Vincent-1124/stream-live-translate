@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,9 @@ pub struct Config {
     /// from that same directory.
     #[serde(default)]
     pub recording_dir: String,
+    /// Guided microphone test timings. Optional so older configs keep working.
+    #[serde(default)]
+    pub audio_test: AudioTestConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +90,11 @@ pub struct LlmConfig {
     pub speech_noise_threshold: f32,
     #[serde(default = "default_semantic_punctuation")]
     pub semantic_punctuation_enabled: bool,
+    /// 热词表（R10）：经百炼 **上下文增强** 下发（`input.context`）。
+    /// 仅 `bailian-fun-asr` 使用；其它 provider 忽略。旧配置缺该字段时按
+    /// 空表处理，因此加了 `#[serde(default)]` 以保持向后兼容。
+    #[serde(default)]
+    pub hotwords: Vec<String>,
 }
 
 fn default_speech_noise_threshold() -> f32 { 0.0 }
@@ -113,6 +122,72 @@ fn default_max_lines() -> u32 {
 
 fn default_display_delay_ms() -> u64 {
     750
+}
+
+fn default_clear_after_ms() -> u64 {
+    4000
+}
+
+/// Bounds for `overlay.clear_after_ms`, shared by the server so a hand-edited
+/// config cannot leave a stale caption on screen forever.
+pub const CLEAR_AFTER_MIN_MS: u64 = 1_000;
+pub const CLEAR_AFTER_MAX_MS: u64 = 15_000;
+
+/// Clamp a configured clear delay into the supported range. `None` (missing
+/// field) keeps the default.
+pub fn clamp_clear_after_ms(value: Option<u64>) -> u64 {
+    value
+        .unwrap_or_else(default_clear_after_ms)
+        .clamp(CLEAR_AFTER_MIN_MS, CLEAR_AFTER_MAX_MS)
+}
+
+fn default_audio_test_quiet_ms() -> u64 {
+    3_000
+}
+
+fn default_audio_test_speech_ms() -> u64 {
+    10_000
+}
+
+/// Bounds for the guided microphone test. Long enough for a meaningful average,
+/// short enough that a calibration run is not a chore.
+pub const AUDIO_TEST_MIN_SEGMENT_MS: u64 = 1_000;
+pub const AUDIO_TEST_MAX_SEGMENT_MS: u64 = 30_000;
+
+pub fn clamp_audio_test_ms(value: Option<u64>, default_ms: u64) -> u64 {
+    value
+        .unwrap_or(default_ms)
+        .clamp(AUDIO_TEST_MIN_SEGMENT_MS, AUDIO_TEST_MAX_SEGMENT_MS)
+}
+
+/// Timings for the guided microphone test (`POST /api/audio-test`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTestConfig {
+    /// Seconds of silence sampled first to establish the background floor.
+    #[serde(default = "default_audio_test_quiet_ms")]
+    pub quiet_ms: u64,
+    /// Seconds of speech sampled afterwards.
+    #[serde(default = "default_audio_test_speech_ms")]
+    pub speech_ms: u64,
+}
+
+impl Default for AudioTestConfig {
+    fn default() -> Self {
+        Self {
+            quiet_ms: default_audio_test_quiet_ms(),
+            speech_ms: default_audio_test_speech_ms(),
+        }
+    }
+}
+
+impl AudioTestConfig {
+    /// Clamped durations actually used by the server.
+    pub fn durations(&self) -> (Duration, Duration) {
+        (
+            Duration::from_millis(clamp_audio_test_ms(Some(self.quiet_ms), default_audio_test_quiet_ms())),
+            Duration::from_millis(clamp_audio_test_ms(Some(self.speech_ms), default_audio_test_speech_ms())),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,15 +267,21 @@ pub struct OverlayConfig {
     /// Older config files predate this key, hence the explicit default.
     #[serde(default = "default_bg_opacity")]
     pub bg_opacity: u32,
-    /// Max caption lines. Text that overflows wraps onto the next line up
-    /// to this count (max 4), then gets clamped with an ellipsis. 1 = strict
-    /// single line, 2 = the default (grow only when the text needs it).
+    /// Max caption lines. Live subtitles are capped at 2: a full page is
+    /// replaced by the next page instead of growing taller. Values above 2 are
+    /// clamped by the overlay, and 1 = strict single line with an ellipsis.
     #[serde(default = "default_max_lines")]
     pub max_lines: u32,
     /// Small display buffer for a new caption page. It gives cumulative ASR
     /// revisions time to settle without adding delay to an already-visible page.
     #[serde(default = "default_display_delay_ms")]
     pub display_delay_ms: u64,
+    /// Clear the caption after this many milliseconds without a new subtitle
+    /// event, and reset the current page so the next page is buffered again.
+    /// Clamped to 1–15 s so a hand-edited config cannot strand old text on
+    /// screen (too long) or clear a sentence mid-read (too short).
+    #[serde(default = "default_clear_after_ms")]
+    pub clear_after_ms: u64,
     /// `bottom` / `top` / `middle`
     pub position: String,
     /// `single` / `double`
@@ -234,6 +315,7 @@ impl Default for Config {
                 workspace_id: String::new(),
                 speech_noise_threshold: default_speech_noise_threshold(),
                 semantic_punctuation_enabled: default_semantic_punctuation(),
+                hotwords: Vec::new(),
             },
             audio: AudioConfig {
                 mode: "system".into(),
@@ -269,19 +351,25 @@ impl Default for Config {
                 bg_opacity: 75,
                 max_lines: 2,
                 display_delay_ms: default_display_delay_ms(),
+                clear_after_ms: default_clear_after_ms(),
                 position: "bottom".into(),
                 layout: "single".into(),
                 animation: "typewriter".into(),
                 mirror_to_text_source: false,
             },
             recording_dir: String::new(),
+            audio_test: AudioTestConfig::default(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{
+        clamp_clear_after_ms, AudioTestConfig, Config, AUDIO_TEST_MAX_SEGMENT_MS,
+        AUDIO_TEST_MIN_SEGMENT_MS, CLEAR_AFTER_MAX_MS, CLEAR_AFTER_MIN_MS,
+    };
+    use std::time::Duration;
 
     #[test]
     fn new_configs_default_to_bailian_realtime() {
@@ -304,11 +392,79 @@ mod tests {
         ] {
             raw = raw.replace(key, "");
         }
+        // The hotword list postdates existing user configs; a config written
+        // before it existed must still load (empty list), not fail to parse.
+        raw = raw
+            .lines()
+            .filter(|line| !line.starts_with("hotwords"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        // A config written before the clear-delay field existed must load with
+        // the 4 s default rather than failing to parse.
+        raw = raw
+            .lines()
+            .filter(|line| !line.starts_with("clear_after_ms"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
         let cfg: Config = toml::from_str(&raw).expect("read older config");
         assert!(cfg.llm.workspace_id.is_empty());
         assert_eq!(cfg.llm.speech_noise_threshold, 0.0);
         assert!(cfg.llm.semantic_punctuation_enabled);
+        assert!(cfg.llm.hotwords.is_empty());
         assert_eq!(cfg.overlay.display_delay_ms, 750);
+        assert_eq!(cfg.overlay.clear_after_ms, 4000);
+        assert_eq!(cfg.audio_test.quiet_ms, 3_000);
+        assert_eq!(cfg.audio_test.speech_ms, 10_000);
+    }
+
+    #[test]
+    fn hotwords_round_trip_through_toml() {
+        let mut cfg = Config::default();
+        cfg.llm.hotwords = vec!["铨洲智造".into(), "区域赛".into()];
+        let raw = toml::to_string(&cfg).expect("serialize");
+        let back: Config = toml::from_str(&raw).expect("deserialize");
+        assert_eq!(back.llm.hotwords, cfg.llm.hotwords);
+    }
+
+    #[test]
+    fn clear_after_is_clamped_to_supported_range() {
+        assert_eq!(clamp_clear_after_ms(None), 4000);
+        assert_eq!(clamp_clear_after_ms(Some(0)), CLEAR_AFTER_MIN_MS);
+        assert_eq!(clamp_clear_after_ms(Some(500)), CLEAR_AFTER_MIN_MS);
+        assert_eq!(clamp_clear_after_ms(Some(6000)), 6000);
+        assert_eq!(clamp_clear_after_ms(Some(999_999)), CLEAR_AFTER_MAX_MS);
+    }
+
+    #[test]
+    fn audio_test_durations_are_clamped() {
+        let cfg = AudioTestConfig { quiet_ms: 0, speech_ms: 999_999 };
+        let (quiet, speech) = cfg.durations();
+        assert_eq!(quiet, Duration::from_millis(AUDIO_TEST_MIN_SEGMENT_MS));
+        assert_eq!(speech, Duration::from_millis(AUDIO_TEST_MAX_SEGMENT_MS));
+        let (dq, ds) = AudioTestConfig::default().durations();
+        assert_eq!(dq, Duration::from_millis(3_000));
+        assert_eq!(ds, Duration::from_millis(10_000));
+    }
+
+    /// `dist/config.toml` is both the shipped template and the embedded default
+    /// (`embedded.rs`), so a typo there breaks first-run for every new user. It
+    /// must therefore parse into the same values as `Config::default()`.
+    #[test]
+    fn the_shipped_config_template_parses_and_matches_the_defaults() {
+        let raw = include_str!("../dist/config.toml");
+        let cfg: Config = toml::from_str(raw).expect("shipped config.toml must parse");
+        let default = Config::default();
+        assert_eq!(cfg.llm.provider, default.llm.provider);
+        assert_eq!(cfg.llm.model, default.llm.model);
+        assert_eq!(cfg.overlay.max_lines, default.overlay.max_lines);
+        assert_eq!(cfg.overlay.display_delay_ms, default.overlay.display_delay_ms);
+        assert_eq!(cfg.overlay.clear_after_ms, default.overlay.clear_after_ms);
+        assert_eq!(cfg.audio_test.quiet_ms, default.audio_test.quiet_ms);
+        assert_eq!(cfg.audio_test.speech_ms, default.audio_test.speech_ms);
+        assert_eq!(cfg.recording_dir, default.recording_dir);
+        // `max_lines` above 2 is silently clamped by the overlay, so shipping a
+        // template that advertises more would be a lie.
+        assert!(cfg.overlay.max_lines <= 2, "template must not advertise >2 lines");
     }
 }
 

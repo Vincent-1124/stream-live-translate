@@ -22,6 +22,10 @@ gateway_text = false        # 本机网关模式（local 通道）：网关返�
 workspace_id = ""           # 可选：百炼业务空间 ID；填后自动使用北京专属域名
 speech_noise_threshold = 0.0 # 百炼 VAD 噪音阈值；先通过回放和试音校准
 semantic_punctuation_enabled = true
+# 热词表（R10）：仅 bailian-fun-asr 使用，经官方"上下文增强"（input.context）下发。
+# 生效机制是词表匹配：这里必须写音频里会出现的**原词**，只写语义描述无效。
+# 建议：含非 ASCII 字符的单条不超过 15 字符；纯英文按空格不超过 7 个片段。
+hotwords = []
 
 [audio]
 mode = "system"             # "system" = 系统音频环回；"device" = 选指定设备；
@@ -55,9 +59,14 @@ bg_opacity = 75              # 背景不透明度 0-100（0=全透明，100=全�
 bg_width = 0                 # 背景宽度 px，0 = 自动贴合文字
 bg_height = 0                # 背景高度 px，0 = 自动（按行数自适应）
 border_radius = 8            # 背景圆角 px
-max_lines = 2                # 字幕显示行数（1-4）：按需折到 2/3/4 行；超出部分直接换到下一句字幕显示。1 = 严格单行 + 省略号
+max_lines = 2                # 字幕最大行数（直播实现上限为 2）：超出的部分换到下一页显示，不做滚动；1 = 严格单行 + 省略号
 display_delay_ms = 750       # 新字幕页的显示缓冲（毫秒，500–1000）
+clear_after_ms = 4000        # 最后一条字幕事件后自动清屏的时长（毫秒，1000–15000）
 position = "bottom"          # bottom | top | middle
 layout = "single"            # single | double
 animation = "typewriter"     # typewriter | fade | slide
 mirror_to_text_source = false
+
+[audio_test]
+quiet_ms = 3000              # 引导试音：先采集多少毫秒安静背景（1000–30000）
+speech_ms = 10000            # 引导试音：再采集多少毫秒讲话（1000–30000）

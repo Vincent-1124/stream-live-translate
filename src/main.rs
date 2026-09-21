@@ -1,4 +1,4 @@
-﻿// Windows: hide the console window when launched from OBS plugin (CreateProcessA
+// Windows: hide the console window when launched from OBS plugin (CreateProcessA
 // already uses CREATE_NO_WINDOW, but Rust still defaults to the console subsystem
 // which can briefly pop a window on startup or whenever something writes to
 // stderr). On other targets this attribute is a no-op.
@@ -7,6 +7,7 @@
 pub mod audio;
 pub mod config;
 pub mod embedded;
+pub mod hotwords;
 pub mod ingest;
 pub mod lang;
 pub mod llm;
@@ -82,6 +83,17 @@ pub struct AppState {
     /// change `audio.mode`, so saving other settings can't break the
     /// audio feed.
     pub forced_audio_mode: Option<String>,
+    /// Consecutive provider-session failures since the last time a session
+    /// actually reached the provider. Drives the exponential reconnect backoff,
+    /// which is capped so a permanently dead endpoint settles at a long interval
+    /// instead of retrying forever at a fixed short one. Reset whenever
+    /// `llm_connected` is observed true.
+    pub provider_failures: std::sync::atomic::AtomicU32,
+    /// 热词下发状态（R10）：管理页据此显示"已下发 N 个热词 / 上次生效时间 /
+    /// 未变化未重发"。只由 provider 写入，不含任何密钥。
+    pub hotword_status: Arc<RwLock<crate::hotwords::HotwordStatus>>,
+    /// 运行期热词源（R10）：管理页保存 → 这里 → provider 的 continue-task。
+    pub hotwords: crate::hotwords::HotwordFeed,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -94,6 +106,10 @@ pub struct AppStatus {
     pub input_frames: u64,
     pub input_rms_sum: f64,
     pub input_peak: f32,
+    /// Wall-clock time of the newest captured frame. Lets the watcher tell a
+    /// live input from one that silently stopped producing frames (OBS scene
+    /// switch, unplugged receiver) without waiting for the channel to close.
+    pub last_input_at: Option<chrono::DateTime<chrono::Utc>>,
     pub llm_connected: bool,
     pub obs_connected: bool,
     pub last_error: Option<String>,
@@ -187,6 +203,10 @@ async fn main() -> Result<()> {
 
     let (config_tx, _config_rx) = tokio::sync::broadcast::channel::<()>(16);
 
+    // 热词（R10）：启动时先用配置里的词表初始化 feed，Provider 一建会话就能带上。
+    let hotwords = crate::hotwords::HotwordFeed::new();
+    hotwords.set(crate::hotwords::plan(&cfg.llm.hotwords));
+
     let state = Arc::new(AppState {
         config: Arc::new(RwLock::new(cfg.clone())),
         config_tx,
@@ -196,6 +216,9 @@ async fn main() -> Result<()> {
         recording: recording::RecordingStore::start(&cfg_path, &cfg.recording_dir),
         obs_cmd_tx: parking_lot::Mutex::new(None),
         forced_audio_mode: cli.audio_mode.clone(),
+        provider_failures: std::sync::atomic::AtomicU32::new(0),
+        hotword_status: Arc::new(RwLock::new(crate::hotwords::HotwordStatus::default())),
+        hotwords,
     });
 
     recording::spawn(state.recording.clone(), state.clone());
@@ -220,7 +243,9 @@ async fn main() -> Result<()> {
     let server_state = state.clone();
     let server_task = tokio::spawn(async move {
         if let Err(e) = server::serve(server_state, server_cfg).await {
-            warn!(error = %e, "server exited");
+            // Full cause chain: anyhow's plain Display would print only the
+            // outermost context and hide the real reason.
+            warn!(error = %format!("{e:#}"), "server exited");
         }
     });
 

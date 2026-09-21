@@ -28,6 +28,18 @@ use axum::routing::{get, post};
 use axum::Router;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
+
+/// How long an explicit config save / restart waits for a still-draining cloud
+/// session before tearing it down. Short enough to feel immediate, long enough
+/// for a `finish-task` drain to deliver its final sentence.
+const SETTINGS_RESTART_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Application-level keepalive between the overlay and this server. The overlay
+/// sends `ping` every 10 s and reconnects if nothing (not even this pong)
+/// arrives for 30 s, which is what catches a half-open TCP connection that the
+/// browser still reports as open.
+const WS_PING_TEXT: &str = "ping";
+const WS_PONG_TEXT: &str = "pong";
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{info, warn};
 
@@ -62,6 +74,7 @@ fn build_router(state: Arc<AppState>, static_dir: PathBuf) -> Router {
         .route("/subtitles", get(get_subtitles))
         .route("/subtitles/clear", post(clear_subtitles))
         .route("/restart", post(restart_pipeline))
+        .route("/stop", post(stop_pipeline))
         .route("/locale", get(get_locale))
         .route("/recordings", get(get_recording_info))
         .route("/recordings/export", get(export_recording))
@@ -209,6 +222,21 @@ async fn get_config(State(state): State<Arc<AppState>>) -> Response {
         llm.insert("api_key".into(), serde_json::Value::String(String::new()));
         llm.insert("api_key_set".into(), serde_json::Value::Bool(key_set));
     }
+    // Send the values the overlay will actually use, so a hand-edited config
+    // cannot make the panel show a delay the browser then clamps away.
+    if let Some(ov) = value.get_mut("overlay").and_then(|v| v.as_object_mut()) {
+        if let Some(stored) = ov.get("clear_after_ms").and_then(|v| v.as_u64()) {
+            ov.insert(
+                "clear_after_ms".into(),
+                serde_json::Value::from(crate::config::clamp_clear_after_ms(Some(stored))),
+            );
+        }
+    }
+    // 热词（R10）：把切分/告警/下发状态一起返回，管理页据此显示"已生效"与
+    // "未变化未重发"。这些字段是从配置计算出来的，不是配置本身，所以不写回磁盘。
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("hotword_status".into(), hotword_view(&state));
+    }
     axum::Json(value).into_response()
 }
 
@@ -251,6 +279,8 @@ async fn post_config(
             cfg.audio.mode = forced.clone();
         }
     }
+    // 热词（R10）：写盘前先取一份最终词表，稍后推给运行期 feed。
+    let hotwords = cfg.llm.hotwords.clone();
     if let Err(e) = cfg.save(&crate::config_path()) {
         // Do NOT pretend success: the admin panel must surface disk-write
         // failures, otherwise users believe their settings were persisted.
@@ -292,14 +322,20 @@ async fn post_config(
             .into_response();
     }
     *state.config.write() = cfg;
+    // 热词（R10）：立刻推进运行期 feed。正在跑的百炼会话会用 continue-task
+    // 收到新词表，关键词变化不算"需要重启"的配置变化（见 pipeline::watch），
+    // 因此保存热词不会掐断当前正在识别的那句话。
+    state.hotwords.set(crate::hotwords::plan(&hotwords));
     // Tell every connected overlay to re-apply the (now updated) style.
     // Without this the OBS browser source keeps the style it fetched at
     // startup, so the user would have to copy a new URL after every save.
     // An empty payload is intentional: receivers re-read state.config.
     let _ = state.config_tx.send(());
     // Restart the pipeline so it picks up the new config immediately
-    // instead of waiting for the next watch() tick.
-    state.pipeline.restart().await;
+    // instead of waiting for the next watch() tick. A provider that is still
+    // draining the last sentence of a finite replay gets a short grace period
+    // so saving settings cannot cut the final subtitle short.
+    state.pipeline.restart(SETTINGS_RESTART_GRACE).await;
     (
         StatusCode::OK,
         axum::Json(serde_json::json!({"ok": true})),
@@ -323,7 +359,7 @@ async fn clear_api_key(State(state): State<Arc<AppState>>) -> Response {
     }
     *state.config.write() = cfg;
     let _ = state.config_tx.send(());
-    state.pipeline.restart().await;
+    state.pipeline.restart(SETTINGS_RESTART_GRACE).await;
     axum::Json(serde_json::json!({"ok": true})).into_response()
 }
 
@@ -418,11 +454,47 @@ struct StatusView {
     /// Set when the engine was launched with --audio-mode (plugin mode);
     /// the panel then locks the audio mode selector.
     audio_mode_forced: Option<String>,
+    /// Guided microphone test timings, so the panel's button label, hint and
+    /// local countdown match what the server will actually do.
+    audio_test_quiet_ms: u64,
+    audio_test_speech_ms: u64,
+    /// 热词（R10）下发状态：管理页用它显示"已下发 N 个热词 / 上次生效时间 /
+    /// 未变化未重发"。
+    hotwords: serde_json::Value,
+}
+
+/// 热词状态视图：词表切分结果 + 词形告警 + 实际下发情况。**不含密钥**。
+fn hotword_view(state: &AppState) -> serde_json::Value {
+    let plan = crate::hotwords::plan(&state.config.read().llm.hotwords);
+    let status = state.hotword_status.read().clone();
+    serde_json::json!({
+        "count": plan.words.len(),
+        "rounds": plan.rounds.len(),
+        "round_texts": plan.rounds,
+        "round_max_chars": crate::hotwords::ROUND_TEXT_MAX_CHARS,
+        "max_rounds": crate::hotwords::MAX_ROUNDS,
+        "dropped_rounds": plan.dropped_rounds,
+        "warnings": plan
+            .warnings
+            .iter()
+            .map(|w| serde_json::json!({"word": w.word, "message": w.message}))
+            .collect::<Vec<_>>(),
+        "delivered": status.delivered,
+        "delivered_count": status.word_count,
+        "delivered_rounds": status.round_count,
+        "delivered_dropped_rounds": status.dropped_rounds,
+        "mode": status.mode,
+        "last_applied_at": status.last_applied_at,
+        "skipped_unchanged": status.skipped_unchanged,
+        "last_result": status.last_result,
+        "provider": state.config.read().llm.provider,
+    })
 }
 
 async fn get_status(State(state): State<Arc<AppState>>) -> Response {
     let cfg = state.config.read().clone();
     let s = state.status.read().clone();
+    let (quiet_dur, speech_dur) = cfg.audio_test.durations();
     let view = StatusView {
         running: state.pipeline.is_running(),
         audio_active: s.audio_active,
@@ -440,6 +512,9 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Response {
         },
         config_path: crate::config_path().display().to_string(),
         audio_mode_forced: state.forced_audio_mode.clone(),
+        audio_test_quiet_ms: quiet_dur.as_millis() as u64,
+        audio_test_speech_ms: speech_dur.as_millis() as u64,
+        hotwords: hotword_view(&state),
     };
     axum::Json(view).into_response()
 }
@@ -471,41 +546,75 @@ fn meter_snapshot(state: &AppState) -> MeterSnapshot {
     MeterSnapshot { frames: status.input_frames, rms_sum: status.input_rms_sum, peak: status.input_peak }
 }
 
+/// Mean RMS over the frames counted since `previous`, plus the frame count of
+/// that window. Pure so the arithmetic behind the guided test is unit-testable
+/// without a capture device.
+///
+/// Returns `None` when `total` holds fewer frames than `previous`, which means
+/// the counters were reset mid-test (a pipeline restart or a second concurrent
+/// test). Subtracting across that reset produces a meaningless average, so the
+/// caller must fail loudly instead of reporting a fabricated level.
+fn average_over_window(total: &MeterSnapshot, previous: Option<&MeterSnapshot>) -> Option<(f64, u64)> {
+    let (base_frames, base_sum) = previous.map_or((0, 0.0), |p| (p.frames, p.rms_sum));
+    if total.frames < base_frames {
+        return None;
+    }
+    let frames = total.frames - base_frames;
+    let sum = (total.rms_sum - base_sum).max(0.0);
+    Some((if frames == 0 { 0.0 } else { sum / frames as f64 }, frames))
+}
+
+/// Advice derived from one guided-test pair of meter snapshots. Split out of
+/// the handler so all four branches are covered by unit tests instead of only
+/// being reachable with a real microphone attached.
+fn audio_test_advice(quiet_avg: f64, speech_avg: f64, peak: f32) -> &'static str {
+    if speech_avg < 0.005 {
+        "讲话音量过低：靠近麦克风或提高输入增益后重试"
+    } else if peak > 0.98 {
+        "检测到可能削波：降低输入增益后重试"
+    } else if speech_avg < quiet_avg * 1.5 {
+        "讲话与背景差异较小：确认选中了无线麦克风，再比较“保留轻声”和“平衡”预设"
+    } else {
+        "输入信号可用；请结合实际字幕再选择过滤预设"
+    }
+}
+
 async fn run_audio_test(State(state): State<Arc<AppState>>) -> Response {
     if !state.status.read().audio_active {
         return (StatusCode::CONFLICT, axum::Json(serde_json::json!({"error": "音频输入未运行，请先保存配置并确认管线启动"}))).into_response();
     }
+    // Durations come from [audio_test] so a microphone that needs a longer
+    // window can be calibrated without editing the binary.
+    let (quiet_dur, speech_dur) = state.config.read().audio_test.durations();
     {
         let mut status = state.status.write();
         status.input_frames = 0;
         status.input_rms_sum = 0.0;
         status.input_peak = 0.0;
     }
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    tokio::time::sleep(quiet_dur).await;
     let quiet = meter_snapshot(&state);
-    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    tokio::time::sleep(speech_dur).await;
     let spoken = meter_snapshot(&state);
-    let quiet_avg = if quiet.frames == 0 { 0.0 } else { quiet.rms_sum / quiet.frames as f64 };
-    let speech_frames = spoken.frames.saturating_sub(quiet.frames);
-    let speech_sum = (spoken.rms_sum - quiet.rms_sum).max(0.0);
-    let speech_avg = if speech_frames == 0 { 0.0 } else { speech_sum / speech_frames as f64 };
+    // A reset inside either window invalidates the pair: report it instead of
+    // telling the user their microphone is too quiet.
+    let Some((quiet_avg, _)) = average_over_window(&quiet, None) else {
+        return (StatusCode::CONFLICT, axum::Json(serde_json::json!({"error": "试音期间音频统计被重置（管线可能刚重启），请重试" }))).into_response();
+    };
+    let Some((speech_avg, speech_frames)) = average_over_window(&spoken, Some(&quiet)) else {
+        return (StatusCode::CONFLICT, axum::Json(serde_json::json!({"error": "试音期间音频统计被重置（管线可能刚重启），请重试" }))).into_response();
+    };
     if spoken.frames == 0 || speech_frames == 0 {
         return (StatusCode::CONFLICT, axum::Json(serde_json::json!({"error": "未收到音频，请检查所选麦克风或 OBS 音源"}))).into_response();
     }
-    let advice = if speech_avg < 0.005 {
-        "讲话音量过低：靠近麦克风或提高输入增益后重试"
-    } else if spoken.peak > 0.98 {
-        "检测到可能削波：降低输入增益后重试"
-    } else if speech_avg < quiet_avg * 1.5 {
-        "讲话与背景差异较小：确认选中了无线麦克风，再比较“保留轻声”和“平衡”预设"
-    } else {
-        "输入信号可用；请结合实际字幕再选择过滤预设"
-    };
+    let advice = audio_test_advice(quiet_avg, speech_avg, spoken.peak);
     axum::Json(serde_json::json!({
         "ok": true,
         "quiet_rms": quiet_avg,
         "speech_rms": speech_avg,
         "peak": spoken.peak,
+        "quiet_ms": quiet_dur.as_millis() as u64,
+        "speech_ms": speech_dur.as_millis() as u64,
         "message": advice,
     })).into_response()
 }
@@ -533,10 +642,37 @@ async fn restart_pipeline(State(state): State<Arc<AppState>>) -> Response {
     // restart() (NOT shutdown()): the pipeline run-loop must stay alive and
     // spin up a fresh pipeline with the current config. shutdown() is
     // permanent and reserved for process exit.
-    state.pipeline.restart().await;
+    //
+    // The grace period only applies when a provider session is still alive
+    // (draining a finite replay): "重启管线" must not discard the sentence the
+    // cloud is about to hand back.
+    //
+    // `resume` first: this endpoint is also how a stopped pipeline is started
+    // again, so it must lift the pause before the run loop is asked to start.
+    state.pipeline.resume().await;
+    state.pipeline.restart(SETTINGS_RESTART_GRACE).await;
     // Broadcast Cleared to all WebSocket clients so overlays clear their state.
     state.subtitle.clear();
     axum::Json(serde_json::json!({"ok": true})).into_response()
+}
+
+/// Stop the current pipeline run and keep it stopped until `/api/restart`.
+///
+/// Without a real stop the run loop only ends on process exit, so a stop that
+/// merely dropped the inner state was undone by the next `try_start` — including
+/// the 30 s first-audio wait, which nothing could interrupt: `/api/restart` and a
+/// config save both answered `{ok:true}` while the previous attempt was still
+/// parked in that wait.
+async fn stop_pipeline(State(state): State<Arc<AppState>>) -> Response {
+    state.pipeline.pause().await;
+    state.subtitle.clear();
+    {
+        let mut s = state.status.write();
+        s.audio_active = false;
+        s.llm_connected = false;
+        s.last_error = Some(crate::pipeline::PIPELINE_STOPPED_MESSAGE.into());
+    }
+    axum::Json(serde_json::json!({"ok": true, "running": false})).into_response()
 }
 
 async fn ws_subtitles(
@@ -555,7 +691,10 @@ struct WsQuery {
 /// Push the current overlay style to one client as `{"type":"config",...}`.
 /// Returns false when the socket died and the caller should stop the loop.
 async fn send_config(socket: &mut WebSocket, state: &Arc<AppState>) -> bool {
-    let ov = state.config.read().overlay.clone();
+    let mut ov = state.config.read().overlay.clone();
+    // Same clamping as GET /api/config: the overlay enforces this range too, so
+    // send the effective value instead of a raw hand-edited one.
+    ov.clear_after_ms = crate::config::clamp_clear_after_ms(Some(ov.clear_after_ms));
     let payload = serde_json::json!({
         "type": "config",
         "overlay": ov,
@@ -628,12 +767,75 @@ async fn ws_loop(mut socket: WebSocket, state: Arc<AppState>) {
                             return;
                         }
                     }
-                    Some(Ok(Message::Text(_))) => {
-                        // Reserved for future client commands.
+                    Some(Ok(Message::Text(text))) => {
+                        // Application-level liveness probe from the overlay.
+                        // TCP can be half-open (NAT timeout, sleeping machine)
+                        // without the browser ever firing `close`, so the
+                        // overlay pings and expects *something* back; a silent
+                        // peer would otherwise look identical to a dead stream.
+                        if text.as_str() == WS_PING_TEXT {
+                            if socket.send(Message::Text(WS_PONG_TEXT.into())).await.is_err() {
+                                return;
+                            }
+                        }
+                        // Everything else is reserved for future client commands.
                     }
                     _ => {}
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(frames: u64, rms_sum: f64, peak: f32) -> MeterSnapshot {
+        MeterSnapshot { frames, rms_sum, peak }
+    }
+
+    #[test]
+    fn quiet_window_average_uses_all_frames() {
+        let total = snap(4, 0.04, 0.02);
+        let (avg, frames) = average_over_window(&total, None).expect("first window is always valid");
+        assert_eq!(frames, 4);
+        assert!((avg - 0.01).abs() < 1e-12, "avg was {avg}");
+    }
+
+    #[test]
+    fn speech_window_subtracts_the_quiet_phase() {
+        // 10 frames total: the first 4 belong to the quiet phase.
+        let quiet = snap(4, 0.04, 0.02);
+        let spoken = snap(10, 0.04 + 0.12, 0.20);
+        let (avg, frames) = average_over_window(&spoken, Some(&quiet)).expect("monotonic counters");
+        assert_eq!(frames, 6);
+        assert!((avg - 0.02).abs() < 1e-12, "avg was {avg}");
+    }
+
+    #[test]
+    fn a_window_without_new_frames_is_treated_as_silence() {
+        let quiet = snap(4, 0.04, 0.02);
+        let (avg, frames) = average_over_window(&quiet, Some(&quiet)).expect("zero-length window");
+        assert_eq!(frames, 0);
+        assert_eq!(avg, 0.0);
+    }
+
+    #[test]
+    fn counters_that_move_backwards_are_reported_as_a_reset() {
+        // The counters are zeroed by the start of every test run and by a
+        // pipeline restart, so a shrinking snapshot must be rejected rather
+        // than averaged into a fake "too quiet" verdict.
+        let previous = snap(10, 2.0, 0.5);
+        let current = snap(2, 0.1, 0.1);
+        assert!(average_over_window(&current, Some(&previous)).is_none());
+    }
+
+    #[test]
+    fn advice_covers_too_quiet_clipping_and_insufficient_contrast() {
+        assert!(audio_test_advice(0.001, 0.001, 0.05).contains("音量过低"));
+        assert!(audio_test_advice(0.001, 0.05, 1.0).contains("削波"));
+        assert!(audio_test_advice(0.02, 0.021, 0.2).contains("差异较小"));
+        assert!(audio_test_advice(0.001, 0.05, 0.2).contains("可用"));
     }
 }
