@@ -33,5 +33,5 @@
 
 - 候选版本、已执行离线验证和未执行项见 `docs/ACCEPTANCE_LOG.md`；其中未执行项不视为通过。
 - 真实百炼调用、热词服务、OBS、无线麦克风和录播人工标注均未执行：没有使用或请求 API Key。
-- 项目本地 `.cargo/config.toml` 使用 TLS 校验的 rsproxy 镜像；完整 `cargo test` 已通过 13 项单元测试，`cargo build --release` 已完成。当前候选引擎为 `target/release/stream-live-translate.exe`（3,621,376 bytes，SHA-256 `5EB94B4E7C424B368A18D39118B382701A9E34746F0E5D8E46EA24E021F22235`）。新配置默认百炼模型，旧配置缺少新增百炼字段时保持可读，均有离线测试。OBS 打包脚本已改为使用项目内临时目录，规避含中文用户名路径的 MSVC 链接临时文件错误，并改用 .NET 解压官方 OBS 二进制包以兼容 VS 开发 PowerShell；但本机仍缺 OBS SDK 头文件，候选 OBS 包尚未生成。现有代码并未遵循 rustfmt，因此 `cargo fmt --check` 仍报告大量上游格式差异；未为通过检查而重排全仓。
+- 项目本地 `.cargo/config.toml` 使用 TLS 校验的 rsproxy 镜像；完整 `cargo test` 已通过 14 项单元测试，`cargo build --release` 已完成。当前候选引擎为 `target/release/stream-live-translate.exe`（3,622,400 bytes，SHA-256 `3251A0DBC5864D0FE5C00CE4D90C8F9A8A8BEBCEEC4BA97D2B182C293805302B`）。新配置默认百炼模型，旧配置缺少新增百炼字段时保持可读，均有离线测试。OBS 打包脚本已改为使用项目内临时目录，规避含中文用户名路径的 MSVC 链接临时文件错误，并改用 .NET 解压官方 OBS 二进制包以兼容 VS 开发 PowerShell；但本机仍缺 OBS SDK 头文件，候选 OBS 包尚未生成。现有代码并未遵循 rustfmt，因此 `cargo fmt --check` 仍报告大量上游格式差异；未为通过检查而重排全仓。
 - 额度策略：每个工作单元前后及约每 10 分钟读取额度；五小时窗口剩余不高于 10% 时只保存进度，周窗口剩余不高于 35% 时停止自动开发并保留缓冲。已授权 heartbeat 在窗口重置后继续，不替代人工验收。

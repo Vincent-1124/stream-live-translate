@@ -1,10 +1,10 @@
 # 候选验收记录
 
 日期：2026-09-21  
-候选源码：`02a449a`（包含音频设备异步错误后的状态断开与重连）
+候选源码：`30d3a82`（包含字幕 Final 重传去重与可配置记录目录）
 候选引擎：`target/release/stream-live-translate.exe`  
-文件大小：3,621,376 bytes
-SHA-256：`5EB94B4E7C424B368A18D39118B382701A9E34746F0E5D8E46EA24E021F22235`
+文件大小：3,622,400 bytes
+SHA-256：`3251A0DBC5864D0FE5C00CE4D90C8F9A8A8BEBCEEC4BA97D2B182C293805302B`
 
 ## 已执行的离线验证
 
