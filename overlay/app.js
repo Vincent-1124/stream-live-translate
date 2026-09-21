@@ -528,6 +528,22 @@
     });
   }
 
+  // A browser-only inspection path for layout and timing regressions.  It
+  // never sends audio, does not alter the server's subtitle history, and is
+  // opt-in so normal OBS browser sources are unchanged.
+  function startLocalReplayIfRequested() {
+    if (new URLSearchParams(location.search).get("local-replay") !== "1") return;
+    document.body.dataset.localReplay = "running";
+    const events = [
+      [0, () => replacePartial("这是正在修订的一句字幕，先显示较长的识别结果。")],
+      [500, () => finalize("这是修订后的字幕。")],
+      [1000, () => replacePartial("这是一段用于验证两行分页的本地模拟字幕，它足够长，应该在当前页面填满后切换到后续文字页面，而不产生第三行或滚动。")],
+      [1500, () => finalize("这是一段用于验证两行分页的本地模拟字幕，它足够长，应该在当前页面填满后切换到后续文字页面，而不产生第三行或滚动。")],
+      [5600, () => { document.body.dataset.localReplay = "complete"; }],
+    ];
+    for (const [delay, run] of events) setTimeout(run, delay);
+  }
+
   async function init() {
     initPerfMode();
     // 顺序很关键：先 hash（旧版留下的 URL 参数）再 /api/config，
@@ -536,6 +552,7 @@
     parseHash();
     await loadConfig();
     connectWS();
+    startLocalReplayIfRequested();
     // 字体加载完成会改变行高，重新切一次当前这句。
     if (document.fonts && document.fonts.ready) {
       document.fonts.ready.then(refreshCaption);
