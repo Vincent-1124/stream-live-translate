@@ -19,9 +19,7 @@ $psi.RedirectStandardError = $true
 $process = [Diagnostics.Process]::new()
 $process.StartInfo = $psi
 if (-not $process.Start()) { throw "无法启动 ffmpeg" }
-$stderr = [Text.StringBuilder]::new()
-$process.add_ErrorDataReceived([Diagnostics.DataReceivedEventHandler]{ param($sender, $event) if ($null -ne $event.Data) { [void]$stderr.AppendLine($event.Data) } })
-$process.BeginErrorReadLine()
+$stderrTask = $process.StandardError.ReadToEndAsync()
 
 $client = [Net.Sockets.TcpClient]::new("127.0.0.1", $Port)
 $stream = $client.GetStream()
@@ -42,6 +40,8 @@ try {
 } finally {
     $stream.Dispose(); $client.Dispose()
     if (-not $process.HasExited) { $process.Kill() }
+    $process.WaitForExit()
+    $stderrText = $stderrTask.GetAwaiter().GetResult()
     $process.Dispose()
 }
-[pscustomobject]@{ start = $Start; duration_s = $DurationSeconds; sent_pcm_bytes = $sentBytes; elapsed_s = [math]::Round($clock.Elapsed.TotalSeconds, 2); ffmpeg_stderr = $stderr.ToString().Trim() }
+[pscustomobject]@{ start = $Start; duration_s = $DurationSeconds; sent_pcm_bytes = $sentBytes; elapsed_s = [math]::Round($clock.Elapsed.TotalSeconds, 2); ffmpeg_stderr = $stderrText.Trim() }

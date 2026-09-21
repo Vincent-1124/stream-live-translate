@@ -1167,7 +1167,7 @@ pub mod bailian {
                         ResultEvent::Ignore => {}
                     }
                 }
-                Ok(())
+                Ok::<(), anyhow::Error>(())
             };
             let writer = async move {
                 while let Some(chunk) = audio_rx.recv().await {
@@ -1177,9 +1177,24 @@ pub mod bailian {
                 }
                 let finish = serde_json::json!({ "header": { "action": "finish-task", "task_id": task_id, "streaming": "duplex" }, "payload": { "input": {} } });
                 let _ = write.send(Message::Text(finish.to_string().into())).await;
-                Ok(())
+                Ok::<(), anyhow::Error>(())
             };
-            tokio::select! { result = reader => result, result = writer => result }
+            // A finite replay closes audio_rx after the final PCM frame. The
+            // writer must send finish-task, but that is not the end of the
+            // recognition: Bailian commonly emits the final sentence and
+            // task-finished afterwards. Keep the reader alive for a bounded
+            // drain instead of dropping it as soon as the writer returns.
+            tokio::pin!(reader);
+            tokio::pin!(writer);
+            tokio::select! {
+                result = &mut reader => result,
+                result = &mut writer => {
+                    result?;
+                    tokio::time::timeout(std::time::Duration::from_secs(10), &mut reader)
+                        .await
+                        .context("等待百炼最终识别结果超时")?
+                }
+            }
         }
     }
 
