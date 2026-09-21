@@ -219,6 +219,7 @@
     $("obs-host").value = cfg.obs.host || "127.0.0.1";
     $("obs-port").value = cfg.obs.port || 4455;
     $("obs-password").value = cfg.obs.password || "";
+    $("recording-dir").value = cfg.recording_dir || "";
 
     // Overlay
     $("ov-size").value = cfg.overlay.font_size || 48;
@@ -270,6 +271,7 @@
         port: parseInt($("obs-port").value, 10) || 4455,
         password: $("obs-password").value,
       },
+      recording_dir: $("recording-dir").value.trim(),
       overlay: {
         font_size: parseInt($("ov-size").value, 10) || 48,
         max_lines: Math.min(2, Math.max(1, parseInt($("ov-max-lines").value, 10) || 2)),

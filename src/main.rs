@@ -185,7 +185,7 @@ async fn main() -> Result<()> {
         subtitle: subtitle.clone(),
         pipeline: pipeline.clone(),
         status: status.clone(),
-        recording: recording::RecordingStore::start(&cfg_path),
+        recording: recording::RecordingStore::start(&cfg_path, &cfg.recording_dir),
         obs_cmd_tx: parking_lot::Mutex::new(None),
         forced_audio_mode: cli.audio_mode.clone(),
     });

@@ -45,11 +45,18 @@ struct Inner {
 }
 
 impl RecordingStore {
-    pub fn start(config_path: &Path) -> Self {
+    pub fn start(config_path: &Path, recording_dir: &str) -> Self {
         let started_at_ms = now_ms();
         let session_id = format!("{}-{}", started_at_ms, uuid::Uuid::new_v4());
-        let dir = config_path.parent().unwrap_or_else(|| Path::new("."))
-            .join("recordings");
+        let base = config_path.parent().unwrap_or_else(|| Path::new("."));
+        let requested = PathBuf::from(recording_dir.trim());
+        let dir = if recording_dir.trim().is_empty() {
+            base.join("recordings")
+        } else if requested.is_absolute() {
+            requested
+        } else {
+            base.join(requested)
+        };
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("{session_id}.jsonl"));
         let file = OpenOptions::new().create(true).append(true).open(&path).ok();
@@ -143,7 +150,7 @@ mod tests {
     use super::*;
     #[test]
     fn srt_is_relative_and_monotonic() {
-        let store = RecordingStore::start(Path::new("target/test-config.toml"));
+        let store = RecordingStore::start(Path::new("target/test-config.toml"), "");
         store.append(Record::Final { session_id: store.session_id.clone(), id: "1".into(), text: "你好".into(), language: "zh".into(), started_at_ms: store.started_at_ms, ended_at_ms: store.started_at_ms + 500 });
         assert!(store.srt().contains("00:00:00,000 --> 00:00:01,000"));
     }

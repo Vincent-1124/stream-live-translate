@@ -18,6 +18,11 @@ pub struct Config {
     pub obs: ObsConfig,
     /// Subtitle rendering hints (consumed by browser overlay).
     pub overlay: OverlayConfig,
+    /// Directory for per-session JSONL recordings. Empty keeps recordings
+    /// beside config.toml under `recordings/`; a relative path is resolved
+    /// from that same directory.
+    #[serde(default)]
+    pub recording_dir: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +274,7 @@ impl Default for Config {
                 animation: "typewriter".into(),
                 mirror_to_text_source: false,
             },
+            recording_dir: String::new(),
         }
     }
 }
@@ -294,6 +300,7 @@ mod tests {
             "speech_noise_threshold = 0.0\r\n",
             "semantic_punctuation_enabled = true\r\n",
             "display_delay_ms = 750\r\n",
+            "recording_dir = \"\"\r\n",
         ] {
             raw = raw.replace(key, "");
         }

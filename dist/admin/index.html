@@ -285,6 +285,11 @@
         <span class="hint" id="import-hint">支持 SRT / VTT / TXT / JSON（把字幕加到下方历史区，不写入服务器）</span>
       </div>
       <p id="recording-path" class="hint">本场记录：读取中…</p>
+      <label>
+        <span>录制目录（可选）</span>
+        <input id="recording-dir" type="text" placeholder="留空：配置文件旁的 recordings" />
+        <small class="field-status">可填写绝对路径或相对配置文件的路径；保存后在下次启动引擎时生效。</small>
+      </label>
       <div id="history" class="history">
         <div class="empty-tip">暂无字幕历史。说一句话、或导入一个 SRT/VTT 试试。</div>
       </div>
