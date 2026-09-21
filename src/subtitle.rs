@@ -34,6 +34,11 @@ pub struct SubtitleLine {
 pub struct SubtitleState {
     pub current: Option<SubtitleLine>,
     pub history: Vec<SubtitleLine>,
+    /// Some streaming services retransmit the terminal event.  We do not
+    /// receive a stable sentence ID from every provider, so retain a very
+    /// short local guard only for an identical final arriving without an
+    /// open sentence.
+    last_final: Option<(String, i64)>,
 }
 
 #[derive(Clone)]
@@ -77,6 +82,13 @@ impl SubtitleSink {
             SubtitleEvent::Final(text) => {
                 let mut s = self.state.lock();
                 let now = chrono::Utc::now().timestamp_millis();
+                if s.current.is_none()
+                    && s.last_final.as_ref().is_some_and(|(last, at)| {
+                        last == text && now.saturating_sub(*at) < 500
+                    })
+                {
+                    return;
+                }
                 if let Some(cur) = s.current.as_mut() {
                     // A final result is authoritative.  It may be shorter
                     // than a partial after punctuation or a decoding revision,
@@ -110,6 +122,9 @@ impl SubtitleSink {
                     }
                     s.history.push(line.clone());
                     s.current = None;
+                }
+                if !text.is_empty() {
+                    s.last_final = Some((text.clone(), now));
                 }
             }
             SubtitleEvent::Cleared => {
@@ -231,5 +246,14 @@ mod tests {
         let history = hub.history();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].text, "这是一段字幕");
+    }
+
+    #[test]
+    fn ignores_immediate_duplicate_final_without_an_open_sentence() {
+        let hub = SubtitleHub::default();
+        let sink = hub.sink();
+        sink.push(SubtitleEvent::Final("重复的最终字幕".into()));
+        sink.push(SubtitleEvent::Final("重复的最终字幕".into()));
+        assert_eq!(hub.history().len(), 1);
     }
 }
