@@ -83,7 +83,7 @@ SHA-256：`3251A0DBC5864D0FE5C00CE4D90C8F9A8A8BEBCEEC4BA97D2B182C293805302B`
 | 输入音量表用于现场校准 | **本轮已实现（代码级，未在浏览器/OBS 验证）** | 2026-09-21 16:0x 更正：已加 1 秒轮询（`admin/app.js:679,794-800`，隐藏标签页暂停 `:797`）与 `#input-level-rms` 原始 RMS 数值读数 + 阈值/预设对照（`admin/index.html:136`、`admin/app.js:684-697`）。原“不成立”结论适用于 16:0x 之前的代码 |
 | 清屏时长可配置（R06） | **本轮已实现（代码级，未在浏览器验证）** | 2026-09-21 16:0x 更正：新增 `overlay.clear_after_ms`（默认 4000，钳制 1000–15000：`src/config.rs:122-137,278-279`），管理页提供 2–8 秒选项（`admin/index.html:208-218`），overlay 读取并二次钳制（`overlay/app.js:25-26,364-368`），`/api/config` 与 WS 推送均下发钳制值（`src/server.rs:225-231,630`）。原“未实现”结论适用于 16:0x 之前的代码 |
 | “重启即开无音频云任务” | **部分修复（代码级，未编译验证运行）** | 2026-09-21 16:0x：`try_start` 已不再置 `audio_active=true`（`src/pipeline.rs:398-408`），改由首帧真实音频置真（`src/pipeline.rs:437-445`），并新增 2 秒停滞检测 `AUDIO_STALL_AFTER`（`src/pipeline.rs:63-88,328-338`）。但 provider 仍在会话建立时立即 `run-task`（`src/llm.rs:1124-1135`，本轮未改），空会话尚未完全消除 |
-| 三档过滤预设的实际降噪效果 | **未成立（结论未变）** | 预设只改本地 `silence_rms`（`admin/app.js:343-355`），不影响送往云端的音频；`speech_noise_threshold` 仍无任何预设或界面入口。本轮只增加了可手工编辑的 `silence_rms` 与「自定义」档，未改变这一结论 |
+| 三档过滤预设的实际降噪效果 | **入口已闭合（代码级 + 本地 HTTP 证据）；降噪实效仍未验证** | 2026-09-21 22:0x 更正：预设现同时写 `speech_noise_threshold`（云端）与 `silence_rms`（本地），并新增数值输入与四个快捷档位。该值确实进入 `run-task` 参数（单测 `speech_noise_threshold_reaches_the_run_task_parameters`）并经 `/api/config` 读写（8897 自测）。**但“能压掉多少垃圾字幕 / 断句碎到什么程度”本轮完全未测**：按要求没有跑任何校准或整场回放。上一版“预设只改本地 `silence_rms`”的结论适用于 22:0x 之前的代码 |
 | 门控的 200 ms 句首预留 / 300 ms 句尾尾音 / Music 帧静音补偿 | **未实现（结论未变）** | `src/pipeline.rs` 与 `src/vad.rs` 中仍无 200/300 ms 预留；`Music` 帧仍直接丢弃、不补同长度静音（`src/pipeline.rs:451-453`） |
 | `artifacts/acceptance/<候选版本>/` 证据目录 | 未建立 | 目录不存在；`build/replay-samples/` 同样不存在（2026-09-21 16:0x 复核，结论未变） |
 
@@ -110,3 +110,110 @@ SHA-256：`3251A0DBC5864D0FE5C00CE4D90C8F9A8A8BEBCEEC4BA97D2B182C293805302B`
 - `cargo test --bin stream-live-translate`：**48 passed / 0 failed**。
 - **未执行**：预编译热词（`vocabulary_id`）、`qwen-audio-3.0-asr-flash-streaming` 通道、
   真实 OBS 内的管理页交互、真实麦克风。
+
+## 2026-09-21 22:0x 追加：`speech_noise_threshold` 用户可调 + 过滤预设真正管到云端
+
+任务：把官方 `run-task.parameters.speech_noise_threshold`（取值 `[-1.0, 1.0]`）做成管理页
+可调项，并让「过滤预设」真正影响识别结果。
+
+> **文档事故声明（必读）**：本节写入时，本文件在 HEAD 版本（112 行，止于 18:0x 追加节）之上
+> **丢失了一节未提交内容**——原先工作树里还有一节「2026-09-22 追加：前端 / 配置三项任务（0 秒
+> 无缓冲、长句翻页闪烁、管理页控件审计）」，含 59 项管理页控件审计表与 `node --check` / `dist`
+> 哈希 / 密钥扫描记录。该节**未提交、且在本次操作中被 `git checkout -- docs/ACCEPTANCE_LOG.md`
+> 覆盖**，工作区内无副本，无法恢复。相关前端改动本身仍在（`admin/*`、`overlay/*`、
+> `tests/*` 已落盘），需要重新生成那份审计表。**教训：不要用 `git checkout --` 处理带未提交
+> 改动的文件。**
+
+### 命令与原始结果
+
+| 命令 / 装置 | 结果 |
+|---|---|
+| `cargo test --offline`（`CARGO_HOME=.build-tools\cargo`、`RUSTUP_HOME=.build-tools\rustup`、`RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-msvc`） | **57 passed / 0 failed（exit 0）**；基线 50 → 本轮 +7：`config::tests::speech_noise_threshold_is_clamped_and_nan_safe`、`config::tests::speech_noise_threshold_round_trips_through_toml`、`llm::bailian::tests::speech_noise_threshold_reaches_the_run_task_parameters`、`llm::bailian::tests::out_of_range_thresholds_are_clamped_before_run_task`、`llm::bailian::tests::run_task_parameters_are_stable_and_language_hints_are_optional`、`server::tests::a_config_patch_carries_speech_noise_threshold`、`server::tests::out_of_range_patches_are_clamped_the_same_way_as_the_save_path` |
+| `node tests/admin-preset-cases.mjs`（新增） | **15 passed / 0 failed（exit 0）**：输入属性 `type=number min=-1 max=1 step=0.1`、启动回填 0.9、四个快捷按钮渲染、四档「阈值 + 本地静音」双值联动、保存 patch 含 `llm.speech_noise_threshold`、越界钳制、手改回落「自定义」、`custom` 档不回落到预设、生效值提示、输入框清空不谎报「尚未生效」、非百炼通道提示、旧控件名 / `PRESET_RMS` 无残留 |
+| `node tests/run-overlay-tests.mjs` | **25 passed / 0 failed / 0 known-failing（exit 0）** —— 与基线一致（本轮未改 overlay） |
+| `node tests/run-negative-control.mjs` | **NEGATIVE CONTROL PASSED（exit 0）** —— 与基线一致 |
+| `node --check`（`admin/app.js`、`overlay/app.js`、`tests/admin-preset-cases.mjs`、`tests/run-overlay-tests.mjs`、`tests/run-negative-control.mjs`） | 全部 exit 0 |
+| 自测引擎（**8897**，mock provider，独立 config 副本 `.build-tools/selftest-8897/config.toml`，`--headless`） | 见下方「真实 API 响应」。**未触碰 8787/8788（用户 OBS 引擎）与 8797/8798**；启动后核对进程 `Path` 即 `target\release\stream-live-translate.exe` |
+| 旧配置兼容（**8899**，`config.toml` 删掉 `speech_noise_threshold` 整行） | 引擎正常启动；`GET /api/config` → `0`；`GET /api/status` → `0`（exit 0） |
+| `dist` 与源码 SHA-256 | `admin/app.js` `2F61770E325EC380BFAF2745BDADAD906965B7128AB3C697DEF220F709A4775C`、`admin/index.html` `8027180F212E1B91D8214862854C358A6BDCF9A324DD5A1E61E2D66641E321EE`、`admin/style.css` `DDC3BB2A8B9CFBF696AFCAD479C4BD647832C549948518C3C18C529010445151`，三对逐一 identical；`overlay/app.js` `7A54701A6BAB24771E011D1FAE7A9BF39A41FC828B94F70591814F1C5A53B428` 两侧也 identical |
+| `cargo build --release --offline` | `Finished release profile in 1m 05s`；`target/release/stream-live-translate.exe` = 3,766,784 B（**只用于本轮自测；未安装、未替换 OBS 侧引擎**） |
+
+原始输出：`.build-tools/selftest-8897/evidence.txt`、`stdout.log`、`stderr.log`。
+
+### 真实 API 响应（8897 自测引擎，逐字复制）
+
+保存 0.9 之后 `GET /api/config` 的 `llm` 段：
+
+```json
+{
+  "llm": {
+    "api_key": "",
+    "api_key_set": false,
+    "endpoint": "",
+    "gateway_text": false,
+    "hotwords": [],
+    "model": "mock",
+    "provider": "mock",
+    "segment_ms": 0,
+    "semantic_punctuation_enabled": true,
+    "speech_noise_threshold": 0.8999999761581421,
+    "speech_noise_threshold_clamped": false,
+    "system_prompt": "",
+    "target_lang": "zh",
+    "transcribe": false,
+    "transcription_model": "",
+    "translate_chinese": false,
+    "workspace_id": ""
+  }
+}
+```
+
+`GET /api/status`：
+
+```json
+{ "speech_noise_threshold": 0.9, "speech_noise_threshold_clamped": false }
+```
+
+写读序列（每步都是真实 HTTP 往返）：
+
+| 步骤 | 请求 | 结果 |
+|---|---|---|
+| 1 | `GET /api/config`（磁盘值 0.0） | `speech_noise_threshold = 0`，`clamped = false` |
+| 2 | `POST /api/config {"llm":{"speech_noise_threshold":0.9}}` | HTTP 200 `{"ok":true}`；读回 `0.8999999761581421`（f32 精度） |
+| 3 | `POST {"llm":{"speech_noise_threshold":5}}` | 读回 **`1`**，`clamped = true` |
+| 4 | `POST {"llm":{"speech_noise_threshold":-9}}` | 读回 **`−1`**，`clamped = true` |
+| 5 | `POST {"llm":{"speech_noise_threshold":0.9},"filter":{"silence_rms":0.012}}`（面板「0.9 强」档的 patch） | 读回 `0.8999999761581421` / `0.012000000104308128`，`clamped` 清零 |
+| 6 | 磁盘 `config.toml` | `speech_noise_threshold = 0.8999999761581421`、`silence_rms = 0.012000000104308128` |
+| 7 | `GET /admin` | 200；HTML 含 `id="speech-noise-threshold"`、`type="number" min="-1" max="1" step="0.1"`、`id="noise-preset-buttons"`、`id="noise-threshold-status"`、`保存配置后会重启识别会话`（6/6 FOUND） |
+
+`speech_noise_threshold_clamped` 为什么必须单独存：钳过之后配置里就是边界值本身，
+"用户填的是 5.0"再也从配置里看不出来，所以由 `AppState.speech_noise_threshold_clamped`
+在保存路径记录，`GET /api/config` 与 `/api/status` 都回传它。
+
+### 管理页控件表（22/23 号控件的更正）
+
+本文件「管理页控件审计」表（原 22/23 行：`#filter-preset` / `#silence-rms` → `filter.silence_rms`，
+两层引用见 `docs/IMPLEMENTATION_STATUS.md` 同名小节）**只描述 22:0x 之前的行为，已被本轮取代**：
+
+| 控件 | 现在写入 | 后端 | 可用性 |
+|---|---|---|---|
+| `#filter-preset`（0.0 关 / 0.3 中等 / 0.6 较强 / 0.9 强 / 自定义） | `llm.speech_noise_threshold` **+** `filter.silence_rms` | `POST /api/config` | 可用（无头 15/15） |
+| `#noise-preset-buttons`（四个快捷档位） | 同上（点按钮 = 选预设） | 同上 | 可用 |
+| `#speech-noise-threshold`（`min=-1 max=1 step=0.1`） | `llm.speech_noise_threshold` | 同上（服务端再钳一次） | 可用 |
+| `#noise-threshold-status` | 只读：「当前生效值」/「尚未生效」/「已按边界值下发」/「非百炼通道不下发」 | `GET /api/status`、`GET /api/config` | 可用 |
+| `#silence-rms` | `filter.silence_rms`（仅「自定义」档显示） | 同上 | 可用 |
+
+设计取舍：**预设保持单一入口、同时设置两个值**（不拆成两个预设控件），因为用户面对的是
+「降噪强度」这一个取舍；拆开会变成两套互相打架的选择。副作用是原来的 `strong`
+（`silence_rms = 0.020`）不再改本地阈值——「强过滤」的语义改由**云端阈值**承担，因为本地
+阈值越狠丢的帧越多、且不减少噪声幻觉。界面按要求**不标注**任何"实测/未实测"字样。
+
+### 本轮未验证（不得视为通过）
+
+- **0.3 / 0.6 两档没有任何实测数据**（按要求没有跑校准或整场回放）。
+- **阈值对真实百炼识别结果的影响未测**：`run-task` 参数只由单元测试断言，
+  没有用真实端点抓 `run-task` 首帧。真实端到端（垃圾字幕条数、断句碎度）本轮 0 证据。
+- **面板在真实浏览器 / OBS dock 里未验证**：快捷按钮高亮、`silence_rms` 行显隐、
+  「当前生效值」与 1 秒轮询的配合只有无头 DOM 断言，没有浏览器证据。
+- 非百炼通道「该阈值不会下发」的提示只是界面文案，未逐通道实测。
+- 界面不标注实测状态，用户看不到「哪些值有实测数据」——这是用户明确要求的结果。

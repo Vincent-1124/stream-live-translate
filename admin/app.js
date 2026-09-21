@@ -251,6 +251,11 @@
   let statusPollTimer = null; // /api/status 轮询句柄
   let audioTestQuietMs = 3000;   // 引导试音的安静段（服务端 [audio_test] 值）
   let audioTestSpeechMs = 10000; // 引导试音的讲话段
+  // 「当前生效值」的两个来源：/api/config（刚保存/刚加载）与 /api/status
+  // （轮询）。后者更新，但前者带着 `_clamped` 标记，所以两者分开存、用时优先
+  // 取最新的那个。
+  let lastThresholdReadback = { value: null, clamped: false, loaded: false };
+  let lastThresholdLive = { value: null, active: false };
 
   // ---- 性能模式 ---------------------------------------------------------
   // Shared with the overlay through localStorage (same origin). The overlay
@@ -302,6 +307,47 @@
            `${parseInt(h.slice(4, 6), 16)},${alpha})`;
   }
   const PREVIEW_SCALE = 0.45;
+
+  /// Mirrors overlay/app.js `clampDisplayDelayMs()`: 0 = no buffer (the first
+  /// page is shown the instant it arrives), everything else is clamped into
+  /// 500–1000 ms. A missing/garbage value keeps the 750 ms default.
+  ///
+  /// `Math.max(500, …)` on the raw field used to turn the new "0 秒（无缓冲）"
+  /// choice into a 500 ms buffer the moment the panel was saved.
+  function clampDisplayDelay(raw) {
+    if (raw === null || raw === undefined || raw === "") return 750;
+    const ms = Number(raw);
+    if (!isFinite(ms)) return 750;
+    if (ms === 0) return 0;
+    return Math.min(1000, Math.max(500, ms));
+  }
+
+  /// Point a <select> at the option that best represents `value`: the exact
+  /// option, otherwise the numerically closest one, otherwise `fallback`.
+  ///
+  /// Without this, a legal-but-unlisted value (display_delay_ms = 0 before this
+  /// option existed, or a hand-edited clear_after_ms = 5000) left the select
+  /// BLANK — and `parseInt("")`/`|| default` then wrote the default back on the
+  /// next save, silently changing the user's configuration.
+  function setSelectValue(sel, value, fallback) {
+    if (!sel) return;
+    const options = [...sel.options].map((o) => o.value);
+    const want = String(value);
+    if (options.includes(want)) {
+      sel.value = want;
+      return;
+    }
+    const target = Number(value);
+    let best = null;
+    if (isFinite(target)) {
+      for (const option of options) {
+        const n = Number(option);
+        if (!isFinite(n)) continue;
+        if (best === null || Math.abs(n - target) < Math.abs(Number(best) - target)) best = option;
+      }
+    }
+    sel.value = best !== null ? best : String(fallback);
+  }
 
   function num(id, dflt) {
     const el = $(id);
@@ -357,7 +403,21 @@
     const rms = Number(cfg.filter && cfg.filter.silence_rms);
     const rmsValue = isFinite(rms) && rms > 0 ? rms : 0.012;
     $("silence-rms").value = String(rmsValue);
-    $("filter-preset").value = presetForRms(rmsValue);
+    // 云端阈值：`_clamped` 由服务端给出（手改 config.toml 写越界值时），
+    // 这时显示的必须是服务端真正会下发的值，并把"被钳过"告诉用户。
+    const thresholdClamped = !!(cfg.llm && cfg.llm.speech_noise_threshold_clamped);
+    const threshold = clampThreshold(cfg.llm ? cfg.llm.speech_noise_threshold : 0);
+    $("speech-noise-threshold").value = String(threshold);
+    // 预设由**两个**数值共同决定：任一被手改过就是「自定义」，避免面板显示的
+    // 预设名与实际保存的值不一致。
+    $("filter-preset").value = presetForValues(threshold, rmsValue);
+    syncPresetUI();
+    lastThresholdReadback = {
+      value: threshold,
+      clamped: thresholdClamped,
+      loaded: true,
+    };
+    renderThresholdStatus();
 
     // OBS
     $("obs-auto").checked = !!cfg.obs.auto_connect;
@@ -369,8 +429,10 @@
     // Overlay
     $("ov-size").value = cfg.overlay.font_size || 48;
     $("ov-max-lines").value = cfg.overlay.max_lines || 2;
-    $("ov-display-delay").value = cfg.overlay.display_delay_ms || 750;
-    $("ov-clear-after").value = cfg.overlay.clear_after_ms || 4000;
+    // 0 = 「无缓冲」 is a legal value: `|| 750` would silently turn it back into
+    // a 750 ms buffer, and an unlisted value used to leave the select blank.
+    setSelectValue($("ov-display-delay"), cfg.overlay.display_delay_ms ?? 750, 750);
+    setSelectValue($("ov-clear-after"), cfg.overlay.clear_after_ms ?? 4000, 4000);
     $("ov-bg-width").value = cfg.overlay.bg_width || 0;
     $("ov-bg-height").value = cfg.overlay.bg_height || 0;
     $("ov-border-radius").value = cfg.overlay.border_radius || 8;
@@ -432,7 +494,7 @@
       overlay: {
         font_size: parseInt($("ov-size").value, 10) || 48,
         max_lines: Math.min(2, Math.max(1, parseInt($("ov-max-lines").value, 10) || 2)),
-        display_delay_ms: Math.min(1000, Math.max(500, parseInt($("ov-display-delay").value, 10) || 750)),
+        display_delay_ms: clampDisplayDelay($("ov-display-delay").value),
         clear_after_ms: Math.min(15000, Math.max(1000, parseInt($("ov-clear-after").value, 10) || 4000)),
         bg_width: Math.max(0, parseInt($("ov-bg-width").value, 10) || 0),
         bg_height: Math.max(0, parseInt($("ov-bg-height").value, 10) || 0),
@@ -446,27 +508,168 @@
     };
   }
 
-  const PRESET_RMS = { soft: 0.007, balanced: 0.012, strong: 0.020 };
+  // ---- 云端噪声判定阈值 + 本地静音阈值 -----------------------------------
+  //
+  // 两个不同的东西，一个预设同时管它们：
+  //   * `speech_noise_threshold` —— **云端**语音/噪音判定阈值，随 run-task 下发，
+  //     只对 bailian-fun-asr 生效。越高越能压掉环境噪声（连带噪声幻觉字幕），
+  //     代价是可能把主讲人的话判成噪声、断句更碎。会话建立后不可改，
+  //     所以保存配置会重启识别会话。
+  //   * `filter.silence_rms` —— **本地**静音判定，低于它的帧直接不进管线。
+  //
+  // 「自定义」档（或任何手改数值的动作）会把预设切到 custom，但**不改动**
+  // 另一个数值：用户可能只想微调云端阈值，不想连带改本地静音阈值。
+  const PRESET_VALUES = {
+    soft: { threshold: 0.0, silenceRms: 0.007 },
+    balanced: { threshold: 0.3, silenceRms: 0.012 },
+    straight: { threshold: 0.6, silenceRms: 0.012 },
+    strong: { threshold: 0.9, silenceRms: 0.012 },
+  };
+  const PRESET_LABELS = {
+    soft: "0.0 关",
+    balanced: "0.3 中等",
+    straight: "0.6 较强",
+    strong: "0.9 强",
+    custom: "自定义",
+  };
+  // 快捷档位按钮：一个按钮就是一次完整的预设选择。按钮的 label 必须与它
+  // 实际会写入的阈值一致，否则用户按「0.6」却看到输入框变成 0.9。
+  const PRESET_BUTTONS = [
+    { preset: "soft", label: "0.0 关" },
+    { preset: "balanced", label: "0.3 中等" },
+    { preset: "straight", label: "0.6 较强" },
+    { preset: "strong", label: "0.9 强" },
+  ];
 
-  function presetForRms(rms) {
-    for (const [name, value] of Object.entries(PRESET_RMS)) {
-      if (Math.abs(rms - value) < 1e-9) return name;
+  /// 钳制云端阈值到官方 [-1.0, 1.0]。空/非法值回落到 0.0（关）。
+  function clampThreshold(raw) {
+    if (raw === null || raw === undefined || raw === "") return 0.0;
+    const n = Number(raw);
+    if (!isFinite(n)) return 0.0;
+    return Math.min(1, Math.max(-1, n));
+  }
+
+  /// 从两个数值反推预设名；任一不匹配就是 custom。
+  function presetForValues(threshold, rms) {
+    for (const [name, value] of Object.entries(PRESET_VALUES)) {
+      if (Math.abs(threshold - value.threshold) < 1e-9 &&
+          Math.abs(rms - value.silenceRms) < 1e-9) return name;
     }
     return "custom";
   }
 
+  /// 应用一个预设：写 select、写输入框、同步按钮高亮与状态文案。
+  function applyPreset(preset, opts) {
+    const keepOther = !!(opts && opts.keepOther);
+    const values = PRESET_VALUES[preset];
+    if (values) {
+      $("speech-noise-threshold").value = String(values.threshold);
+      if (!keepOther) $("silence-rms").value = String(values.silenceRms);
+    }
+    $("filter-preset").value = values ? preset : "custom";
+    syncPresetUI();
+  }
+
+  /// 按钮高亮 + 「自定义（高级）」行的显隐。只做展示，不写配置。
+  function syncPresetUI() {
+    const current = $("filter-preset").value;
+    const buttons = document.querySelectorAll("#noise-preset-buttons .btn");
+    buttons.forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.preset === current);
+    });
+    const advanced = $("silence-rms-row");
+    if (advanced) advanced.style.display = current === "custom" ? "" : "none";
+  }
+
+  /// 阈值的数值输入只允许 [-1, 1]；超出范围立即钳回并说明，避免"填了 5
+  /// 却悄悄按 1 生效"这种不知情。空值不钳（用户正在输入时不要抢键盘）。
+  function enforceThresholdRange() {
+    const el = $("speech-noise-threshold");
+    if (!el || el.value === "") return null;
+    const typed = Number(el.value);
+    if (!isFinite(typed)) return null;
+    const clamped = clampThreshold(typed);
+    if (clamped !== typed) {
+      el.value = String(clamped);
+      toast(`噪声判定阈值范围为 −1 ~ 1，已改为 ${clamped}`, "info");
+    }
+    return clamped;
+  }
+
   function filterPresetPatch() {
     const preset = $("filter-preset").value;
-    // "自定义" reads the numeric field so a threshold typed by hand is saved
-    // verbatim instead of being snapped back to a preset value.
-    if (preset === "custom") {
-      const typed = Number($("silence-rms").value);
-      return { silence_rms: isFinite(typed) && typed >= 0 ? typed : 0.012 };
+    // 保存前再钳一次，确保送出去的 payload 一定在官方区间内。
+    const threshold = clampThreshold($("speech-noise-threshold").value);
+    $("speech-noise-threshold").value = String(threshold);
+    // 「自定义」读输入框：手改的值原样保存，不回落到预设。
+    const rmsTyped = Number($("silence-rms").value);
+    const silenceRms = preset === "custom"
+      ? (isFinite(rmsTyped) && rmsTyped >= 0 ? rmsTyped : 0.012)
+      : PRESET_VALUES[preset].silenceRms;
+    if (preset !== "custom") $("silence-rms").value = String(silenceRms);
+    return { speech_noise_threshold: threshold, silence_rms: silenceRms };
+  }
+
+  /// 快捷档位按钮只建一次；点击等同于选择对应的预设。
+  function renderThresholdButtons() {
+    const box = $("noise-preset-buttons");
+    if (!box || box.childElementCount) return;
+    PRESET_BUTTONS.forEach((spec) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn ghost";
+      btn.dataset.preset = spec.preset;
+      btn.textContent = spec.label;
+      box.appendChild(btn);
+    });
+    syncPresetUI();
+  }
+
+  /// 「当前生效值」。三件事必须同时说清楚：
+  ///   1. 服务端真正会下发给云端的数值（越界时是钳过的值，不是输入框里那个）；
+  ///   2. 它已经生效、还是要保存/重启后才会生效；
+  ///   3. 当前通道是否用它。
+  function renderThresholdStatus() {
+    const el = $("noise-threshold-status");
+    if (!el) return;
+    const parts = [];
+    let kind = "hint dim";
+    // 轮询值（服务端当前配置）优先：它就是"现在生效"的那个数。
+    const live = lastThresholdLive.active ? lastThresholdLive : null;
+    const readback = lastThresholdReadback.loaded ? lastThresholdReadback : null;
+    if (live) {
+      parts.push(`当前生效值 ${live.value}`);
+      kind = "hint ok";
+    } else if (readback) {
+      parts.push(`当前生效值 ${readback.value}`);
+      kind = "hint";
+    } else {
+      parts.push("当前生效值：读取中…");
     }
-    const value = preset === "soft" ? 0.007 : preset === "strong" ? 0.020 : 0.012;
-    // Keep the numeric field in step for the next round-trip.
-    $("silence-rms").value = String(value);
-    return { silence_rms: value };
+    const shown = clampThreshold($("speech-noise-threshold").value);
+    const inputEmpty = $("speech-noise-threshold").value === "";
+    const sameAsActive = inputEmpty
+      ? true
+      : (live
+        ? Math.abs(live.value - shown) < 1e-9
+        : (readback ? Math.abs(readback.value - shown) < 1e-9 : true));
+    if (!sameAsActive) {
+      parts.push(`输入框 ${shown} 尚未生效：保存配置后会在重启识别会话时下发`);
+      kind = "hint warn";
+    }
+    const clamped = (readback && readback.clamped) || (live && live.clamped);
+    if (clamped) {
+      parts.push("配置文件里的值超出 −1 ~ 1，已按边界值下发");
+      kind = "hint warn";
+    }
+    const providerType = $("provider-type") ? $("provider-type").value : "";
+    if (providerType && providerType !== "bailian") {
+      parts.push("当前通道不是百炼 Fun-ASR，该阈值不会下发（仍会保存）");
+      kind = "hint dim";
+    }
+    el.textContent = parts.join("　|　");
+    el.className = kind;
+    el.hidden = false;
   }
 
   function updateProviderUI() {
@@ -500,9 +703,22 @@
     $("gateway_row").style.display = providerType === "local" ? "" : "none";
     $("workspace-row").style.display = isBailian ? "" : "none";
     $("low_latency_ms_row").style.display = $("low_latency").checked ? "" : "none";
+    // 云端噪声判定阈值只有百炼 fun-asr 的 run-task 支持；其它通道明确提示它会
+    // 被忽略（值仍保存，切回百炼即刻生效）。
+    const noiseRow = $("noise-preset-row");
+    if (noiseRow) noiseRow.classList.toggle("locked", !isBailian);
+    const noiseLabel = $("speech-noise-threshold");
+    if (noiseLabel) {
+      noiseLabel.disabled = !isBailian;
+      const labelRow = noiseLabel.closest("label");
+      if (labelRow) labelRow.classList.toggle("locked", !isBailian);
+    }
+    const noiseHint = $("noise-provider-hint");
+    if (noiseHint) noiseHint.hidden = isBailian;
     // 热词走百炼上下文增强，只有 bailian-fun-asr 支持；其它通道提示不支持。
     const hwCard = $("hotword-card");
     if (hwCard) hwCard.classList.toggle("locked", !isBailian);
+    renderThresholdStatus();
     renderHotwordWarnings();
   }
 
@@ -551,6 +767,38 @@
     }
     return best;
   }
+
+  /// 预览分页必须和 overlay/app.js 的 `sameOpenSentence()` 同一套语义：累计修订
+  /// （replace:true）是对**同一句**的修订，句子的边界是 final/cleared，不是某一帧
+  /// 的形状。判定不一致时预览会在长句上反复从第一页重画 —— 也就是用户在 OBS 上
+  /// 看到的那种"两段字幕交替闪烁"。
+  function previewCommonPrefix(a, b) {
+    const n = Math.min(a.length, b.length);
+    let i = 0;
+    while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+    return i;
+  }
+  function previewCommonSuffix(a, b) {
+    const n = Math.min(a.length, b.length);
+    let i = 0;
+    while (i < n && a.charCodeAt(a.length - 1 - i) === b.charCodeAt(b.length - 1 - i)) i++;
+    return i;
+  }
+  function previewSameSentence(prev, next) {
+    if (!prev || !next) return false;
+    if (next.startsWith(prev) || prev.startsWith(next)) return true;
+    if (next.length * 2 < prev.length) return false;
+    const shorter = Math.min(prev.length, next.length);
+    const shared = previewCommonPrefix(prev, next) + previewCommonSuffix(prev, next);
+    return shorter < 8 ? shared > 0 : shared * 4 >= shorter;
+  }
+
+  /// 渲染当前这一页。光标只在"剩下的装不下"时前进（与 overlay 的 pickShown()
+  /// 一致）。
+  ///
+  /// 旧实现在装不下时把 `previewFindCut()` 返回的**结束下标**当成起始下标用，
+  /// 然后渲染 `slice(pageStart)` —— 也就是整句的尾巴：预览框只有两行高，却塞进
+  /// 了四五行的文字，而且永远看不到真正会被显示的第一页。
   function renderPreview() {
     const lineEl = $("preview-line");
     if (!lineEl) return;
@@ -559,16 +807,24 @@
     const lh = parseFloat(getComputedStyle(caption).lineHeight) || 0;
     const maxH = previewLines * lh;
     if (maxH <= 0) { lineEl.textContent = previewText; return; }
-    if (previewPageStart > previewText.length) previewPageStart = 0;
-    if (previewMeasure(previewText.slice(previewPageStart)) > maxH) {
-      previewPageStart = previewFindCut(previewText, previewPageStart, maxH);
+    if (previewPageStart >= previewText.length) previewPageStart = 0;
+    const cut = previewFindCut(previewText, previewPageStart, maxH);
+    let shown;
+    if (cut >= previewText.length) {
+      shown = previewText.slice(previewPageStart);
+    } else {
+      shown = previewText.slice(previewPageStart, cut);
+      if (shown) previewPageStart = cut;
+      else shown = previewText.slice(0, cut) || previewText.slice(0, 1);
     }
-    const shown = previewText.slice(previewPageStart);
     if (lineEl.textContent !== shown) lineEl.textContent = shown;
   }
   function setPreviewText(text, append) {
-    if (!append) previewPageStart = 0;
-    previewText = text || "";
+    const next = text || "";
+    // A revision of the sentence on screen keeps the page cursor; anything else
+    // (a new sentence, a cleared caption) starts at page 1 again.
+    if (!append || !previewSameSentence(previewText, next)) previewPageStart = 0;
+    previewText = next;
     renderPreview();
   }
 
@@ -806,13 +1062,15 @@
     const rmsText = level < 0.0005 ? "0.00000" : level.toFixed(5);
     const sel = $("filter-preset");
     const preset = sel ? sel.value : "";
-    const presetLabel = { soft: "保留轻声", balanced: "平衡", strong: "强过滤" }[preset] || "自定义";
+    const presetLabel = PRESET_LABELS[preset] || "自定义";
     const threshold = num("silence-rms", 0.012);
     const margin = threshold > 0 && level > 0
       ? (level >= threshold ? "高于阈值" : "低于阈值")
       : "";
+    const noise = clampThreshold($("speech-noise-threshold") ? $("speech-noise-threshold").value : 0);
     el.textContent =
-      `RMS（VAD 前）${rmsText}　静音阈值 ${threshold}${margin ? "（当前" + margin + "）" : ""}　预设 ${presetLabel}`;
+      `RMS（VAD 前）${rmsText}　静音阈值 ${threshold}${margin ? "（当前" + margin + "）" : ""}　` +
+      `云端噪声阈值 ${noise}　预设 ${presetLabel}`;
   }
 
   /// Replace the whole readout whenever the silence threshold is edited, so the
@@ -870,6 +1128,16 @@
       if (isFinite(Number(s.audio_test_quiet_ms))) audioTestQuietMs = Number(s.audio_test_quiet_ms);
       if (isFinite(Number(s.audio_test_speech_ms))) audioTestSpeechMs = Number(s.audio_test_speech_ms);
       renderAudioTestLabels();
+      // 云端噪声判定阈值的"当前生效值"来自 /api/status（服务端已钳制）。
+      const liveThreshold = Number(s.speech_noise_threshold);
+      if (isFinite(liveThreshold)) {
+        lastThresholdLive = {
+          value: clampThreshold(liveThreshold),
+          clamped: !!s.speech_noise_threshold_clamped,
+          active: true,
+        };
+        renderThresholdStatus();
+      }
       set("dot-llm", !!s.llm_connected, s.running && !s.last_error ? true : false);
       set("dot-obs", !!s.obs_connected, false);
       // 热词是否真的下发成功，只有 /api/status 知道（provider 会话开始/更新后写）。
@@ -1294,29 +1562,73 @@
       }
     });
 
-    $("clear-history-btn").addEventListener("click", () => {
-      localImportedRows = [];
-      renderHistory();
-      toast("已清空本地历史", "ok");
+    // 「清空历史」 clears the SERVER history as well as the locally imported
+    // rows. It used to drop only the local rows, so the list came straight back
+    // from /api/subtitles on the next refresh and the button looked broken.
+    $("clear-history-btn").addEventListener("click", async () => {
+      const btn = $("clear-history-btn");
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "清空中…";
+      try {
+        const result = await apiPost("/api/subtitles/history/clear");
+        if (!result || result.ok !== true) {
+          throw new Error((result && result.error) || "服务器未确认清空结果");
+        }
+        localImportedRows = [];
+        lastServerHistory = [];
+        renderHistory();
+        toast("已清空历史（服务端与本页导入）", "ok");
+      } catch (e) {
+        toast("清空历史失败：" + (e.message || e), "error");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
     });
 
-    // Choosing a preset fills the numeric threshold so the two controls never
-    // disagree about what will be saved.
+    // 选择一个预设 = 同时写入云端噪声判定阈值与本地静音阈值，并同步输入框，
+    // 让两个控件永远不会对"将要保存什么"各说一套。
     $("filter-preset").addEventListener("change", () => {
-      const preset = $("filter-preset").value;
-      if (preset !== "custom" && PRESET_RMS[preset] !== undefined) {
-        $("silence-rms").value = String(PRESET_RMS[preset]);
-      }
+      applyPreset($("filter-preset").value);
       refreshRmsReadout();
     });
 
-    // The numeric threshold can be typed directly; keep the preset select and
-    // the live readout honest about what the value now means.
+    // 快捷档位按钮：一个按钮就是一次预设选择，所以仍会把**两个**值一起设成
+    // 该档位的值（与下拉行为一致，避免两个控件给出不同答案）。
+    const presetButtons = $("noise-preset-buttons");
+    if (presetButtons) {
+      presetButtons.addEventListener("click", (e) => {
+        const btn = e.target.closest("button[data-preset]");
+        if (!btn) return;
+        applyPreset(btn.dataset.preset);
+        refreshRmsReadout();
+      });
+    }
+
+    // 「自定义」档：静音阈值可以手改；云端阈值任何档位都可手改。手改后预设
+    // 会切到「自定义」，但另一个数值保持不变。
     $("silence-rms").addEventListener("input", () => {
       const typed = Number($("silence-rms").value);
-      if (isFinite(typed)) $("filter-preset").value = presetForRms(typed);
+      const noise = clampThreshold($("speech-noise-threshold").value);
+      if (isFinite(typed)) $("filter-preset").value = presetForValues(noise, typed);
+      syncPresetUI();
       refreshRmsReadout();
+      renderThresholdStatus();
     });
+
+    // 云端阈值：越界立即钳回并提示；数值变化后预设按"两个值是否都还在档位上"
+    // 重新判定，并刷新「当前生效值」。
+    $("speech-noise-threshold").addEventListener("input", () => {
+      enforceThresholdRange();
+      const noise = clampThreshold($("speech-noise-threshold").value);
+      const rms = Number($("silence-rms").value);
+      if (isFinite(rms)) $("filter-preset").value = presetForValues(noise, rms);
+      syncPresetUI();
+      refreshRmsReadout();
+      renderThresholdStatus();
+    });
+    $("speech-noise-threshold").addEventListener("change", enforceThresholdRange);
 
     const perfBtn = $("perf-mode-btn");
     if (perfBtn) {
@@ -1335,6 +1647,7 @@
     try {
       bindEvents();
       renderPerfModeButton();
+      renderThresholdButtons();
       setupFileImport();
       await loadConfig();
       await loadDevices();

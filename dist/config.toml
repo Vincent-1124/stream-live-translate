@@ -20,7 +20,10 @@ transcribe = false          # 实时字幕模式（GLM/OpenAI 通道）：只显
 transcription_model = ""    # 转写子模型：留空自动（OpenAI 官方默认 gpt-4o-mini-transcribe；GLM 通常不用填）
 gateway_text = false        # 本机网关模式（local 通道）：网关返回的 response.text 直接当字幕（如 huggingface/speech-to-speech）
 workspace_id = ""           # 可选：百炼业务空间 ID；填后自动使用北京专属域名
-speech_noise_threshold = 0.0 # 百炼 VAD 噪音阈值；先通过回放和试音校准
+speech_noise_threshold = 0.0 # 云端语音/噪音判定阈值，范围 -1.0~1.0。越高越能压掉环境噪声，
+                             # 但可能把主讲人的话也判成噪声、并让断句更碎。只对 bailian-fun-asr 生效；
+                             # 随 run-task 下发，改它需要重启识别会话（管理页保存后会自动重启）。
+                             # 管理页「过滤预设」会同时设置它和 [filter] silence_rms。
 semantic_punctuation_enabled = true
 # 热词表（R10）：仅 bailian-fun-asr 使用，经官方"上下文增强"（input.context）下发。
 # 生效机制是词表匹配：这里必须写音频里会出现的**原词**，只写语义描述无效。

@@ -183,6 +183,21 @@ impl SubtitleHub {
         let _ = self.tx.send(SubtitleEvent::Cleared);
         self.state.lock().current = None;
     }
+
+    /// Drop the finished-sentence history as well as the open line.
+    ///
+    /// The panel's 「清空历史」 button used to clear only its locally imported
+    /// rows, so the server-side list came straight back on the next refresh and
+    /// the button looked broken. This is the backing operation for
+    /// `POST /api/subtitles/history/clear`; the on-disk recording
+    /// (`/api/recordings/export`) is a separate store and is NOT affected.
+    pub fn clear_history(&self) {
+        let _ = self.tx.send(SubtitleEvent::Cleared);
+        let mut s = self.state.lock();
+        s.current = None;
+        s.history.clear();
+        s.last_final = None;
+    }
 }
 
 /// Wire format for `/ws/subtitles` clients (overlay + admin preview).
@@ -254,6 +269,32 @@ mod tests {
         let sink = hub.sink();
         sink.push(SubtitleEvent::Final("重复的最终字幕".into()));
         sink.push(SubtitleEvent::Final("重复的最终字幕".into()));
+        assert_eq!(hub.history().len(), 1);
+    }
+
+    /// `clear()` (「清空字幕」) only drops the open line — the panel's
+    /// 「清空历史」 needs `clear_history()`, which must also empty the history
+    /// and forget the duplicate-final guard so the same sentence can be
+    /// recorded again after the clear.
+    #[test]
+    fn clear_history_drops_the_open_line_and_the_history() {
+        let hub = SubtitleHub::default();
+        let sink = hub.sink();
+        sink.push(SubtitleEvent::Final("第一句".into()));
+        sink.push(SubtitleEvent::Replace("正在说的这一句".into()));
+        assert_eq!(hub.history().len(), 1);
+        assert!(hub.current().is_some());
+
+        hub.clear();
+        assert_eq!(hub.history().len(), 1, "clear() must keep the history for the panel");
+
+        hub.clear_history();
+        assert_eq!(hub.history().len(), 0, "clear_history() must empty the history");
+        assert!(hub.current().is_none(), "clear_history() must drop the open line");
+
+        // The dedupe guard is reset with it: a re-sent identical final after an
+        // explicit clear is a new sentence, not a retransmission.
+        sink.push(SubtitleEvent::Final("第一句".into()));
         assert_eq!(hub.history().len(), 1);
     }
 }

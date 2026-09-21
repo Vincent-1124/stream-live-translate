@@ -84,6 +84,105 @@ function pageSliceStart(prefix, shown, start) {
   return start + shown.length;
 }
 
+/**
+ * In-memory probe that records EVERY page handed to `displayShown()`.
+ *
+ * The DOM text is only a *typed prefix* of the page while the typewriter is
+ * running (and empty for one interval right after a page flip), so a case that
+ * needs to know WHICH page was rendered must look at what the overlay decided
+ * to render, not at `textContent`.  `pickShown()` hands `displayShown()` a
+ * slice of the line it just published as `currentText`, so the page's window is
+ * exactly `currentText.indexOf(page)`.
+ *
+ * (Source is patched in memory only; the file on disk is never touched.)
+ */
+export const RENDER_LOG_TRANSFORM = (src) => {
+  const fnAnchor = "  function displayShown(shown) {";
+  if (!src.includes(fnAnchor)) throw new Error("displayShown anchor not found in overlay/app.js");
+  let out = src.replace(
+    fnAnchor,
+    "  const __rendered = [];\n  function displayShown(shown) {\n    __rendered.push(shown);"
+  );
+  const tail = "  init();\n})();";
+  if (!out.includes(tail)) throw new Error("probe anchor not found in overlay/app.js");
+  out = out.replace(
+    tail,
+    "  init();\n  globalThis.__probe = function () { return { pageStart: pageStart, partialBuffer: partialBuffer, currentText: currentText, rendered: __rendered.slice() }; };\n})();"
+  );
+  return out;
+};
+
+/**
+ * Every page rendered since `cursor`, each with its exact window in the
+ * cumulative text (`at` = the offset of the page's first character, `-1` when
+ * the page is not part of the current revision at all).
+ */
+function renderedWindows(ov, cursor) {
+  const st = ov.sandbox.__probe();
+  const pages = st.rendered.slice(cursor).map((page) => {
+    const at = page === "" ? st.pageStart : st.currentText.indexOf(page);
+    return { page, at, end: at < 0 ? -1 : at + page.length, text: st.currentText };
+  });
+  return { cursor: st.rendered.length, probe: st, pages };
+}
+
+/**
+ * Frames of ONE long sentence where the recognizer keeps re-decoding the tail
+ * (a homophone / punctuation correction): frame N+1 is then neither an equals,
+ * a prefix, nor an extension of frame N.  This is what real ASR revisions look
+ * like and what the overlay's own replay fixtures never do.
+ */
+function tailRevisionFrames(text) {
+  const frames = [];
+  for (let i = 0; i < text.length; i++) {
+    const head = text.slice(0, i + 1);
+    frames.push(i > 8 && i % 6 === 0 ? head.slice(0, -1) + "。" : head);
+  }
+  return frames;
+}
+
+/// Frames of ONE long sentence where a word in the middle of the open sentence
+/// is corrected once (everything after the insertion therefore shifts).
+function midRevisionFrames(text, at = 40, insert = "（已更正）", when = 100) {
+  const frames = [];
+  for (let i = 0; i < text.length; i++) {
+    let head = text.slice(0, i + 1);
+    if (i === when) head = head.slice(0, at) + insert + head.slice(at);
+    frames.push(head);
+  }
+  return frames;
+}
+
+/**
+ * Drive one cumulative frame and let the overlay settle, then report every page
+ * it rendered for that frame.  Cumulative (`replace: true`) frames are used
+ * because that is the protocol whose revisions rewrite the open sentence.
+ */
+function driveFrame(ov, text, state) {
+  ov.emitPartial(text, true);
+  state.sinceEmit = 0;
+  // The FIRST render of a page goes through the display buffer; later ones are
+  // immediate.  An empty caption therefore means "buffered", and one buffer
+  // window releases it.
+  if (ov.text === "") {
+    ov.tick(DISPLAY_DELAY_MS);
+    state.sinceEmit += DISPLAY_DELAY_MS;
+  }
+  // Let the typewriter finish the page (no-op for the other animations).
+  for (let step = 0; step < 90; step++) {
+    if (state.sinceEmit > CLEAR_AFTER_MS - 1000) {
+      ov.emitPartial(text, true); // re-arm the silence timer with the same frame
+      state.sinceEmit = 0;
+    }
+    ov.tick(32);
+    state.sinceEmit += 32;
+    if (ov.pendingTimeouts().length <= 1) break;
+  }
+  const r = renderedWindows(ov, state.cursor);
+  state.cursor = r.cursor;
+  return r.pages;
+}
+
 // ---------------------------------------------------------------------------
 // shim self-check — proves the measurement model is not a rubber stamp
 // ---------------------------------------------------------------------------
@@ -728,60 +827,81 @@ export async function testGeometryMatrix({ run }) {
 // ---------------------------------------------------------------------------
 
 export async function testTypewriterPath({ run }) {
-  await run("A1t typewriter animation also never renders a 3rd line", "typewriter", async (load) => {
-    const ov = await load({ overlayConfig: { animation: "typewriter" } });
+  await run("A1t typewriter animation never renders a 3rd line and pages forward", "typewriter", async (load) => {
+    const ov = await load({ overlayConfig: { animation: "typewriter" }, transform: RENDER_LOG_TRANSFORM });
     assert.ok(
       ov.document.body.classList.contains("animation-typewriter"),
       "the body must carry animation-typewriter",
       ov.document.body.className
     );
     const full = LONG_CJK;
-    const silenceBudget = CLEAR_AFTER_MS - 100; // stay inside one clear_after_ms window
     const violations = [];
-    const pagesSeen = new Set();
-    let peak = 0;
-    let maxObserved = 0;
-    let elapsed = 0;
+    const frames = new Set();
+    let cursor = 0;
+    let previousAt = 0;
+    let maxAt = 0;
+    let backwards = 0;
     let reEmits = 0;
-    let pageIndex = 0;
-    let maxPageIndex = 0;
+    let sinceEmit = 0;
 
-    ov.emitPartial(full.slice(0, 1));
-    ov.tick(DISPLAY_DELAY_MS);
+    ov.emitPartial(full.slice(0, 1), true);
+    ov.tick(DISPLAY_DELAY_MS); // release the page buffer
+    cursor = ov.sandbox.__probe().rendered.length;
+
     for (let len = 2; len <= full.length; len++) {
-      ov.emitPartial(full[len - 1]);
-      for (let step = 0; step < 80; step++) {
-        if (elapsed >= silenceBudget) {
-          // The overlay's own silence timer would clear the caption; re-arm the
-          // same text so this test measures the typewriter, not the clear.
-          ov.emitPartial(full[len - 1]);
-          elapsed = 0;
+      const text = full.slice(0, len);
+      ov.emitPartial(text, true);
+      sinceEmit = 0;
+      // Let the typewriter finish the page.  The caption's own silence timer
+      // would clear it mid-drain, so re-arm it with the SAME cumulative frame —
+      // a no-op revision that neither resets the page nor duplicates text
+      // (the delta re-emits this case used to do appended the character twice,
+      // which made the DOM text stop being a slice of the streamed sentence).
+      for (let step = 0; step < 90; step++) {
+        if (sinceEmit > CLEAR_AFTER_MS - 1000) {
+          ov.emitPartial(text, true);
+          sinceEmit = 0;
           reEmits++;
         }
         ov.tick(32);
-        elapsed += 32;
-        const shown = ov.text;
-        if (shown) pagesSeen.add(shown);
-        const lines = ov.lineCount(shown);
-        peak = Math.max(peak, lines);
-        maxObserved = Math.max(maxObserved, shown.length);
+        sinceEmit += 32;
+        if (ov.pendingTimeouts().length <= 1) break; // the typewriter settled
+      }
+      const r = renderedWindows(ov, cursor);
+      cursor = r.cursor;
+      for (const w of r.pages) {
+        frames.add(w.page);
+        const lines = ov.lineCount(w.page);
         if (lines > 2) {
-          violations.push({ len, lines, domLen: shown.length, height: ov.measuredHeight(shown) });
+          violations.push({ len, lines, domLen: w.page.length, height: ov.measuredHeight(w.page) });
         }
-        const end = pageSliceStart(full.slice(0, len), shown, pageIndex);
-        if (end !== null && end < len) {
-          pageIndex = end;
-          maxPageIndex = Math.max(maxPageIndex, pageIndex);
+        if (w.at < 0) {
+          throw new Error(
+            `A1t prefix ${len}: the rendered page is not a slice of the streamed sentence\n` +
+              `  rendered: ${JSON.stringify(w.page.slice(0, 40))}\n` +
+              `  line:     ${JSON.stringify(w.text.slice(0, 40))}`
+          );
         }
-        if (ov.pendingTimeouts().length === 0) break; // animation settled
+        if (w.at < previousAt) {
+          backwards++;
+          if (backwards <= 3) {
+            console.log(
+              `        · A1t prefix ${len}: the page fell back from ${previousAt} to ${w.at}` +
+                ` (rendered ${JSON.stringify(w.page.slice(0, 12))}…)`
+            );
+          }
+        }
+        previousAt = w.at;
+        maxAt = Math.max(maxAt, w.at);
       }
     }
     assert.eq(violations.length, 0, `typewriter two-line cap: ${describeViolations(violations)}`);
-    assert.gt(maxObserved, 0, "the typewriter must actually reveal text");
-    assert.gt(maxPageIndex, 0, "the typewriter path must page forward past the head of the sentence");
+    assert.gt(frames.size, 1, "the typewriter must actually render text");
+    assert.gt(maxAt, 0, "the typewriter path must page forward past the head of the sentence");
+    assert.eq(backwards, 0, `typewriter page stability: the page fell back ${backwards} time(s)`);
     console.log(
-      `        · typewriter: peak ${peak} line(s), longest visible chunk ${maxObserved} chars, ` +
-        `${pagesSeen.size} distinct frames, furthest page started at ${maxPageIndex} ` +
+      `        · typewriter: peak ${Math.max(...[...frames].map((f) => ov.lineCount(f)))} line(s), ` +
+        `${frames.size} distinct rendered pages, furthest page started at ${maxAt} ` +
         `(${reEmits} silence re-arms)`
     );
   });
@@ -871,6 +991,259 @@ export async function testShiftingRevision({ run }) {
 }
 
 // ---------------------------------------------------------------------------
+// A1f — page stability: a re-decoded cumulative revision must never send the
+// caption back to page 1.
+//
+// REAL DEFECT #4 (user report: 「当一句话比较长时出第二段字幕的时候第一段字幕
+// 可能会和第二段字幕交替闪烁」).  `replacePartial()` classified a cumulative
+// frame as a NEW sentence unless one frame was a strict prefix of the other.
+// Real ASR re-decodes the tail (homophone / punctuation) and can insert a word
+// in the middle of the open sentence, so ordinary frames of ONE sentence are
+// neither prefixes nor extensions of each other.  Each such frame reset
+// `pageStart` to 0, so a long sentence rendered page 1, then page 2, then page 1
+// again, then page 2 … — the visible flicker.
+//
+// The invariants pinned here:
+//   1. every rendered page is a contiguous window of the CURRENT revision,
+//   2. the window never moves backwards inside one sentence,
+//   3. the sentence still pages forward, and
+//   4. no rendered page needs a third line.
+// ---------------------------------------------------------------------------
+
+export async function testPageStability({ run }) {
+  const cases = [
+    ["A1f re-decoded cumulative revisions never fall back to page 1", "page-flicker", "fade"],
+    ["A1ft the typewriter path never falls back to page 1 either", "page-flicker-typewriter", "typewriter"],
+  ];
+  for (const [name, caseId, animation] of cases) {
+    await run(name, caseId, async (load) => {
+      const ov = await load({ overlayConfig: { animation }, transform: RENDER_LOG_TRANSFORM });
+      const streams = [
+        ["tail re-decode every 6th frame", tailRevisionFrames(SHIFTING_REVISION_TEXT)],
+        ["word inserted mid-sentence at frame 101", midRevisionFrames(SHIFTING_REVISION_TEXT)],
+        ["pure growth (control)", Array.from({ length: SHIFTING_REVISION_TEXT.length }, (_, i) => SHIFTING_REVISION_TEXT.slice(0, i + 1))],
+      ];
+
+      const summary = [];
+      for (const [label, frames] of streams) {
+        // `cleared` is the protocol's sentence reset, so every stream starts
+        // from a pristine page cursor on the same overlay instance.
+        ov.emitCleared();
+        const state = { cursor: 0, sinceEmit: 0 };
+        state.cursor = ov.sandbox.__probe().rendered.length;
+        let previousAt = 0;
+        let backwards = 0;
+        const violations = [];
+        let furthest = 0;
+        let windowCount = 0;
+
+        for (const text of frames) {
+          for (const w of driveFrame(ov, text, state)) {
+            windowCount++;
+            const lines = ov.lineCount(w.page);
+            if (lines > 2) {
+              violations.push({ lines, domLen: w.page.length, height: ov.measuredHeight(w.page) });
+            }
+            if (w.page === "") {
+              violations.push({ kind: "empty page rendered", at: w.at, textLen: w.text.length });
+              continue;
+            }
+            if (w.at < 0) {
+              violations.push({ kind: "page is not part of the current revision", domLen: w.page.length });
+              continue;
+            }
+            if (w.end > w.text.length) {
+              violations.push({ kind: "page window past the end of the revision", at: w.at, end: w.end, len: w.text.length });
+            }
+            if (w.at < previousAt) backwards++;
+            previousAt = w.at;
+            furthest = Math.max(furthest, w.at);
+          }
+        }
+
+        assert.eq(
+          violations.length,
+          0,
+          `${label}: ${violations.length} page violation(s): ` +
+            violations.slice(0, 3).map((v) => `${v.kind || "3rd line"} @${v.at ?? "?"} (${v.domLen ?? v.textLen} chars)`).join("; ")
+        );
+        assert.gt(furthest, 0, `${label}: the sentence must page forward past the head (one page = 62 CJK chars)`);
+        assert.eq(
+          backwards,
+          0,
+          `${label}: the rendered page fell back to an earlier page ${backwards} time(s) — ` +
+            `this is the page-1 / page-2 flicker the user reported (invariant: the page window ` +
+            `must never move backwards while one sentence is being revised)`
+        );
+        summary.push(`${label}: ${windowCount} pages, furthest @${furthest}`);
+      }
+
+      // --- a revision that TRIMS the sentence back to fewer pages ----------
+      // The cursor is already on the last page when the recognizer drops a
+      // clause, so the revision no longer reaches it.  The caption must keep
+      // showing the newest words (the last page that still fits), never fall
+      // back to page 1 and never render an empty page.
+      ov.emitCleared();
+      const trimState = { cursor: ov.sandbox.__probe().rendered.length, sinceEmit: 0 };
+      for (let len = 1; len <= SHIFTING_REVISION_TEXT.length; len++) {
+        driveFrame(ov, SHIFTING_REVISION_TEXT.slice(0, len), trimState);
+      }
+      const trimmed = SHIFTING_REVISION_TEXT.slice(0, 100); // still more than one page
+      const last = driveFrame(ov, trimmed, trimState).pop();
+      assert.ok(last, "the trimmed revision must render a page", last);
+      assert.gt(last.at, 0, "a trimmed revision still longer than one page must not fall back to page 1", last.at);
+      assert.eq(last.end, trimmed.length, "the trimmed revision must show the newest words (page ends at the tail)");
+      summary.push(`trim to ${trimmed.length} chars -> last page @${last.at}`);
+
+      assert.lte(ov.maxHeightPx, 120, "the two-line viewport is unchanged");
+      console.log(`        · ${animation}: ${summary.join(" | ")}`);
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A3c — display_delay_ms = 0 is a REAL "no buffering" mode.
+//
+// The user asked for a 0-second ("no buffer") choice: the first page of a
+// caption must reach the screen the moment it arrives, with no timer at all.
+// ---------------------------------------------------------------------------
+
+export async function testZeroBuffer({ run }) {
+  await run("A3c display_delay_ms=0 shows the first page immediately (no timer)", "delay-zero", async (load) => {
+    const fade = await load({ overlayConfig: { display_delay_ms: 0 } });
+    const before = fade.pendingTimeouts().length;
+    fade.emitPartial("零缓冲的第一句");
+    assert.eq(fade.text, "零缓冲的第一句", "with display_delay_ms=0 the text must be visible in the same tick it arrives");
+    assert.eq(
+      fade.pendingTimeouts().length,
+      before + 1,
+      "a 0 ms buffer must NOT create a display timer (only the silence timer is armed)"
+    );
+    assert.eq(fade.displayDeadline(), CLEAR_AFTER_MS, "the earliest one-shot timer is the silence clear, not a buffer");
+    assert.ok(fade.isShown, "the caption must be visible immediately", fade.isShown);
+
+    // A brand-new page after a silence clear must also skip the buffer.
+    fade.tick(CLEAR_AFTER_MS);
+    assert.eq(fade.text, "", "the silence clear still applies with a 0 ms buffer");
+    fade.emitPartial("清屏后的新一句", true);
+    assert.eq(fade.text, "清屏后的新一句", "the page after a clear must also appear with no buffer");
+
+    // The typewriter path is the shipped default: the FIRST unit must not wait
+    // for a type interval either, otherwise "no buffer" would still be 32 ms late.
+    const typed = await load({ overlayConfig: { display_delay_ms: 0, animation: "typewriter" } });
+    typed.emitPartial("打字机零缓冲");
+    assert.gt(typed.text.length, 0, "the typewriter must reveal its first unit synchronously when the buffer is off");
+    assert.ok(
+      "打字机零缓冲".startsWith(typed.text),
+      "the immediately revealed typewriter text must be a prefix of the page",
+      typed.text
+    );
+
+    // Clamping: 0 is legal, 500–1000 is the buffer window, everything else
+    // clamps INTO that window (a negative value is not "0/no buffer").
+    const clamped = [
+      [0, 0],
+      [500, 500],
+      [1000, 1000],
+      [250, 500],
+      [-100, 500],
+      [100000, 1000],
+    ];
+    for (const [configured, expected] of clamped) {
+      const o = await load({ overlayConfig: { display_delay_ms: configured } });
+      o.emitPartial("钳制检查");
+      if (expected === 0) {
+        assert.eq(o.text, "钳制检查", `display_delay_ms=${configured} must be treated as "no buffer"`);
+      } else {
+        o.tick(expected - 1);
+        assert.eq(o.text, "", `display_delay_ms=${configured} must clamp to ${expected} ms (still pending at ${expected - 1} ms)`);
+        o.tick(1);
+        assert.eq(o.text, "钳制检查", `display_delay_ms=${configured} must display at ${expected} ms`);
+      }
+    }
+    console.log(
+      "        · 0 ms = immediate (fade + typewriter); 250/-100 -> 500; 100000 -> 1000; 0 -> no display timer"
+    );
+  });
+}
+
+// ---------------------------------------------------------------------------
+// A6 — the overlay's own debug/demo path (`/overlay?local-replay=1`).
+//
+// This is the "字幕调试窗口" the user can open in a browser: it replays fixed
+// samples through the REAL event handlers on a timer, with no audio, no network
+// and no effect on server history.  Driving the harness' fake clock through the
+// whole timeline is therefore an end-to-end check of that path.
+// ---------------------------------------------------------------------------
+
+export async function testLocalReplayPath({ run }) {
+  await run("A6 ?local-replay=1 debug path stays clean end to end", "local-replay", async (load) => {
+    const ov = await load({ search: "?local-replay=1", transform: RENDER_LOG_TRANSFORM });
+    assert.eq(
+      ov.document.body.dataset.localReplay,
+      "running",
+      "the replay must announce itself on <body data-local-replay>"
+    );
+
+    // The replay timeline: samples at 0 / 500 / 1000 / 1500 / 2200 ms, the
+    // completion marker at 6200 ms (which is also when the silence clear fires,
+    // because the last subtitle event was at 2200 ms and clear_after_ms = 4000).
+    let cursor = 0;
+    let everShown = 0;
+    let flips = 0;
+    let previousPage = null;
+    let resized = false;
+    for (let t = 0; t <= 12000; t += 16) {
+      ov.tick(16);
+      // The long sample arrives as ONE frame, so one event renders page 1 and
+      // arms the next page.  A real browser re-renders on `document.fonts.ready`
+      // / resize, which is how pages 2..n reach the screen; drive that here so
+      // the debug path is checked for the page turn as well.
+      if (!resized && t >= 2400) {
+        resized = true;
+        ov.resize();
+      }
+      const r = renderedWindows(ov, cursor);
+      cursor = r.cursor;
+      for (const w of r.pages) {
+        // The very first render is `renderStyle()` on an empty line during
+        // init(); an empty page is only a defect once the line HAS content.
+        if (w.page === "" && w.text !== "") {
+          throw new Error(`t=${t} ms: the replay rendered an EMPTY page (a visible blank frame)`);
+        }
+        if (w.page !== "" && w.at < 0) {
+          throw new Error(
+            `t=${t} ms: the replay rendered a page that is not part of the current line\n` +
+              `  page: ${JSON.stringify(w.page.slice(0, 40))}\n` +
+              `  line: ${JSON.stringify(w.text.slice(0, 40))}`
+          );
+        }
+        const lines = ov.lineCount(w.page);
+        if (lines > 2) {
+          throw new Error(
+            `t=${t} ms: the replay rendered ${lines} lines (${w.page.length} chars): ` +
+              JSON.stringify(w.page.slice(0, 40))
+          );
+        }
+        everShown++;
+        if (previousPage !== null && w.page !== previousPage && w.at > 0) flips++;
+        previousPage = w.page;
+      }
+    }
+
+    assert.eq(
+      ov.document.body.dataset.localReplay,
+      "complete",
+      "the replay must reach its completion marker (it never finished)"
+    );
+    assert.gt(everShown, 3, "the debug path must actually render the samples");
+    assert.gt(flips, 0, "the long sample must page forward, so the debug path exercises the fix");
+    assert.eq(ov.text, "", "the caption must be cleared again once the replay goes silent");
+    console.log(`        · local-replay: ${everShown} rendered pages, ${flips} forward page turns, cleared at the end`);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // plan
 // ---------------------------------------------------------------------------
 
@@ -881,11 +1254,14 @@ export const TEST_PLAN = [
   { id: "replace", title: "two-line cap + paging (cumulative replace stream)", fn: testReplaceStream },
   { id: "replay", title: "overlay's own replay fixtures", fn: testReplayFixtures },
   { id: "shifting", title: "shifting cumulative revision (page stays inside the revision)", fn: testShiftingRevision },
+  { id: "flicker", title: "page stability: a re-decoded revision never falls back to page 1", fn: testPageStability },
   { id: "buffer", title: "display buffer semantics", fn: testBufferSemantics },
+  { id: "buffer-zero", title: "display_delay_ms = 0 is a real no-buffer mode", fn: testZeroBuffer },
   { id: "clear", title: "clear-after-silence", fn: testClearAfterSilence },
   { id: "semantics", title: "replace semantics", fn: testReplaceSemantics },
   { id: "geometry", title: "geometry / config matrix", fn: testGeometryMatrix },
   { id: "typewriter", title: "typewriter animation path", fn: testTypewriterPath },
+  { id: "local-replay", title: "the overlay's own ?local-replay=1 debug path", fn: testLocalReplayPath },
 ];
 
 /**

@@ -10,6 +10,9 @@
 //!   GET  /api/status            -> { running, audio, llm, obs, last_error }
 //!   GET  /api/subtitles         -> current + history
 //!   POST /api/subtitles/clear   -> clear current line
+//!   POST /api/subtitles/history/clear -> clear current line + history
+//!                                  (the panel's 「清空历史」 button)
+//!   GET  /api/recordings/export -> download this session's subtitles
 //!   GET  /api/locale            -> { language } — host OS UI language
 //!                                  ("zh" | "en"), used by the admin panel
 //!                                  to pick its interface language
@@ -73,6 +76,7 @@ fn build_router(state: Arc<AppState>, static_dir: PathBuf) -> Router {
         .route("/connection-test", post(test_connection))
         .route("/subtitles", get(get_subtitles))
         .route("/subtitles/clear", post(clear_subtitles))
+        .route("/subtitles/history/clear", post(clear_subtitle_history))
         .route("/restart", post(restart_pipeline))
         .route("/stop", post(stop_pipeline))
         .route("/locale", get(get_locale))
@@ -221,6 +225,25 @@ async fn get_config(State(state): State<Arc<AppState>>) -> Response {
     if let Some(llm) = value.get_mut("llm").and_then(|v| v.as_object_mut()) {
         llm.insert("api_key".into(), serde_json::Value::String(String::new()));
         llm.insert("api_key_set".into(), serde_json::Value::Bool(key_set));
+        // 云端噪声判定阈值：管理页的 <input min=-1 max=1> 只是界面提示，
+        // 这里回传真正会下发给云端的值，避免"面板显示一个数、run-task 发另
+        // 一个数"。
+        if let Some(stored) = llm.get("speech_noise_threshold").and_then(|v| v.as_f64()) {
+            llm.insert(
+                "speech_noise_threshold".into(),
+                serde_json::Value::from(crate::config::clamp_speech_noise_threshold(stored as f32)),
+            );
+        }
+        // 是否钳过由保存路径记在 AppState 上：一旦钳过，磁盘里存的就是边界值，
+        // 只看配置是看不出"用户填的是 5.0"的。
+        llm.insert(
+            "speech_noise_threshold_clamped".into(),
+            serde_json::Value::Bool(
+                state
+                    .speech_noise_threshold_clamped
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        );
     }
     // Send the values the overlay will actually use, so a hand-edited config
     // cannot make the panel show a delay the browser then clamps away.
@@ -229,6 +252,14 @@ async fn get_config(State(state): State<Arc<AppState>>) -> Response {
             ov.insert(
                 "clear_after_ms".into(),
                 serde_json::Value::from(crate::config::clamp_clear_after_ms(Some(stored))),
+            );
+        }
+        // 0 (「0 秒（无缓冲）」) is a legal value, so this cannot be a plain
+        // clamp: `clamp_display_delay_ms` keeps 0 and windows the rest.
+        if let Some(stored) = ov.get("display_delay_ms").and_then(|v| v.as_u64()) {
+            ov.insert(
+                "display_delay_ms".into(),
+                serde_json::Value::from(crate::config::clamp_display_delay_ms(Some(stored))),
             );
         }
     }
@@ -265,6 +296,21 @@ async fn post_config(
     }
     if incoming_key_empty {
         cfg.llm.api_key = state.config.read().llm.api_key.clone();
+    }
+    // 云端噪声判定阈值：越界值在写盘前就钳进 [-1.0, 1.0]。避免把会被云端拒绝
+    // 的值写进 config.toml，也避免"面板存 5.0、云端实际收到 1.0"这种不一致。
+    {
+        let raw = cfg.llm.speech_noise_threshold;
+        let (clamped, was_clamped) = crate::config::clamp_speech_noise_threshold_flagged(raw);
+        if was_clamped {
+            info!(from = raw, to = clamped, "speech_noise_threshold out of range; clamped to [-1.0, 1.0]");
+            cfg.llm.speech_noise_threshold = clamped;
+        }
+        // 记在运行期：钳过之后配置里只剩边界值，"越界过"这件事只能靠这个标记
+        // 让管理页如实显示；下次保存合法值时自动清掉。
+        state
+            .speech_noise_threshold_clamped
+            .store(was_clamped, std::sync::atomic::Ordering::Relaxed);
     }
     // The OBS plugin launches the engine with --audio-mode obs_filter;
     // the audio feed comes from the plugin itself. Never let a panel
@@ -458,6 +504,11 @@ struct StatusView {
     /// local countdown match what the server will actually do.
     audio_test_quiet_ms: u64,
     audio_test_speech_ms: u64,
+    /// 云端噪声判定阈值（`run-task.parameters.speech_noise_threshold`）当前
+    /// 生效值，已钳制到 [-1.0, 1.0]。管理页据此显示"当前生效值"，并与用户
+    /// 在输入框里填的值对照；`_clamped` 为真时说明填的值被钳过。
+    speech_noise_threshold: f32,
+    speech_noise_threshold_clamped: bool,
     /// 热词（R10）下发状态：管理页用它显示"已下发 N 个热词 / 上次生效时间 /
     /// 未变化未重发"。
     hotwords: serde_json::Value,
@@ -495,6 +546,10 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Response {
     let cfg = state.config.read().clone();
     let s = state.status.read().clone();
     let (quiet_dur, speech_dur) = cfg.audio_test.durations();
+    let noise_threshold = crate::config::clamp_speech_noise_threshold(cfg.llm.speech_noise_threshold);
+    let noise_threshold_clamped = state
+        .speech_noise_threshold_clamped
+        .load(std::sync::atomic::Ordering::Relaxed);
     let view = StatusView {
         running: state.pipeline.is_running(),
         audio_active: s.audio_active,
@@ -514,6 +569,8 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Response {
         audio_mode_forced: state.forced_audio_mode.clone(),
         audio_test_quiet_ms: quiet_dur.as_millis() as u64,
         audio_test_speech_ms: speech_dur.as_millis() as u64,
+        speech_noise_threshold: noise_threshold,
+        speech_noise_threshold_clamped: noise_threshold_clamped,
         hotwords: hotword_view(&state),
     };
     axum::Json(view).into_response()
@@ -638,6 +695,14 @@ async fn clear_subtitles(State(state): State<Arc<AppState>>) -> Response {
     axum::Json(serde_json::json!({"ok": true})).into_response()
 }
 
+/// Clear the finished-sentence history as well as the open line, so the panel's
+/// 「清空历史」 button has a backend that matches its label. The recording store
+/// behind `/api/recordings/export` is untouched.
+async fn clear_subtitle_history(State(state): State<Arc<AppState>>) -> Response {
+    state.subtitle.clear_history();
+    axum::Json(serde_json::json!({"ok": true, "history": 0})).into_response()
+}
+
 async fn restart_pipeline(State(state): State<Arc<AppState>>) -> Response {
     // restart() (NOT shutdown()): the pipeline run-loop must stay alive and
     // spin up a fresh pipeline with the current config. shutdown() is
@@ -695,6 +760,8 @@ async fn send_config(socket: &mut WebSocket, state: &Arc<AppState>) -> bool {
     // Same clamping as GET /api/config: the overlay enforces this range too, so
     // send the effective value instead of a raw hand-edited one.
     ov.clear_after_ms = crate::config::clamp_clear_after_ms(Some(ov.clear_after_ms));
+    // 0 = 「无缓冲」 is legal, so the delay uses its own rule (0, or 500–1000).
+    ov.display_delay_ms = crate::config::clamp_display_delay_ms(Some(ov.display_delay_ms));
     let payload = serde_json::json!({
         "type": "config",
         "overlay": ov,
@@ -837,5 +904,35 @@ mod tests {
         assert!(audio_test_advice(0.001, 0.05, 1.0).contains("削波"));
         assert!(audio_test_advice(0.02, 0.021, 0.2).contains("差异较小"));
         assert!(audio_test_advice(0.001, 0.05, 0.2).contains("可用"));
+    }
+
+    /// POST /api/config 走的是 `merge_json`：面板提交的
+    /// `llm.speech_noise_threshold` 必须落进 Config，且保存后的 GET 能读回。
+    #[test]
+    fn a_config_patch_carries_speech_noise_threshold() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.llm.speech_noise_threshold, 0.0);
+        let patch = serde_json::json!({"llm": {"speech_noise_threshold": 0.9}});
+        merge_json(&mut cfg, &patch).expect("merge threshold patch");
+        assert_eq!(cfg.llm.speech_noise_threshold, 0.9);
+        // 0.0 也是合法值，必须真的写回 0.0 而不是被当成"缺省/空"忽略。
+        let patch = serde_json::json!({"llm": {"speech_noise_threshold": 0.0}});
+        merge_json(&mut cfg, &patch).expect("merge zero threshold");
+        assert_eq!(cfg.llm.speech_noise_threshold, 0.0);
+        let patch = serde_json::json!({"llm": {"speech_noise_threshold": -1.0}});
+        merge_json(&mut cfg, &patch).expect("merge negative threshold");
+        assert_eq!(cfg.llm.speech_noise_threshold, -1.0);
+    }
+
+    /// 越界补丁会被 POST 处理路径钳回 [-1.0, 1.0]（同一套钳制函数），
+    /// 所以磁盘里不会留下云端会拒绝的值。
+    #[test]
+    fn out_of_range_patches_are_clamped_the_same_way_as_the_save_path() {
+        for (raw, expected) in [(5.0_f32, 1.0_f32), (-5.0, -1.0), (0.35, 0.35)] {
+            let (clamped, was_clamped) =
+                crate::config::clamp_speech_noise_threshold_flagged(raw);
+            assert_eq!(clamped, expected);
+            assert_eq!(was_clamped, clamped != raw);
+        }
     }
 }

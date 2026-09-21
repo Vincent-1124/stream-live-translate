@@ -1110,6 +1110,47 @@ pub mod bailian {
         }
     }
 
+    /// `run-task` 的 `payload.parameters`。
+    ///
+    /// 抽成独立函数是为了让"管理页存下的 `speech_noise_threshold` 真的进了
+    /// `run-task`"这件事可被单元测试直接断言：`run()`（真实会话）与
+    /// `test_connection()`（连接测试）都走这一份构造，不存在两条各写一遍、
+    /// 改一条漏一条的可能。
+    ///
+    /// 该参数在 `run-task` 时下发一次，会话建立后无法修改，因此**改这个值
+    /// 必须重启识别会话**（管理页保存配置后会自动重启）。
+    pub(crate) fn run_task_parameters(cfg: &LlmConfig) -> serde_json::Value {
+        serde_json::json!({
+            "format": "pcm",
+            "sample_rate": 16000,
+            "semantic_punctuation_enabled": cfg.semantic_punctuation_enabled,
+            // 服务端已钳制到 [-1.0, 1.0]（config::clamp_speech_noise_threshold）；
+            // 这里再钳一次，保证任何调用路径（含手工构造的 cfg）都发不出去越界值。
+            "speech_noise_threshold": crate::config::clamp_speech_noise_threshold(cfg.speech_noise_threshold),
+            "heartbeat": true,
+        })
+    }
+
+    /// 完整的 `run-task` 首帧（`run()` 与连接测试共用同一份形状，只差
+    /// `language_hints`）。抽出来是为了让"管理页存的值进了 run-task"可被
+    /// 单元测试直接断言，而不是靠读代码推断。
+    pub(crate) fn run_task_payload(
+        cfg: &LlmConfig,
+        task_id: &str,
+        input: serde_json::Value,
+        language_hints: bool,
+    ) -> serde_json::Value {
+        let mut parameters = run_task_parameters(cfg);
+        if language_hints {
+            parameters["language_hints"] = serde_json::json!(["zh"]);
+        }
+        serde_json::json!({
+            "header": { "action": "run-task", "task_id": task_id, "streaming": "duplex" },
+            "payload": { "task_group": "audio", "task": "asr", "function": "recognition", "model": cfg.model,
+                "parameters": parameters, "input": input }
+        })
+    }
+
     pub async fn test_connection(cfg: LlmConfig) -> Result<()> {
         let provider = BailianFunAsr::new(cfg)?;
         // 连接测试也携带已保存的热词，这样"测试已保存的连接"能覆盖
@@ -1123,11 +1164,7 @@ pub mod bailian {
         let (ws, _) = tokio_tungstenite::connect_async(request).await.map_err(|e| ws_connect_error(e, "连接百炼 Fun-ASR"))?;
         let (mut write, mut read) = ws.split();
         let task_id = uuid::Uuid::new_v4().to_string();
-        let start = serde_json::json!({
-            "header": { "action": "run-task", "task_id": task_id, "streaming": "duplex" },
-            "payload": { "task_group": "audio", "task": "asr", "function": "recognition", "model": provider.cfg.model,
-                "parameters": { "format": "pcm", "sample_rate": 16000, "semantic_punctuation_enabled": provider.cfg.semantic_punctuation_enabled, "speech_noise_threshold": provider.cfg.speech_noise_threshold, "heartbeat": true }, "input": input }
-        });
+        let start = run_task_payload(&provider.cfg, &task_id, input, false);
         write.send(Message::Text(start.to_string().into())).await.context("启动百炼识别测试")?;
         let started = tokio::time::timeout(std::time::Duration::from_secs(8), async {
             while let Some(message) = read.next().await {
@@ -1213,12 +1250,7 @@ pub mod bailian {
                 .write()
                 .record_applied(&initial_plan, "run-task", chrono::Utc::now());
 
-            let start = serde_json::json!({
-                "header": { "action": "run-task", "task_id": task_id, "streaming": "duplex" },
-                "payload": { "task_group": "audio", "task": "asr", "function": "recognition", "model": self.cfg.model,
-                    "parameters": { "format": "pcm", "sample_rate": 16000, "semantic_punctuation_enabled": self.cfg.semantic_punctuation_enabled, "speech_noise_threshold": self.cfg.speech_noise_threshold, "heartbeat": true, "language_hints": ["zh"] },
-                    "input": initial_plan.input_json() }
-            });
+            let start = run_task_payload(&self.cfg, &task_id, initial_plan.input_json(), true);
             write.send(Message::Text(start.to_string().into())).await.context("启动百炼识别任务")?;
 
             // Service policy requires task-started before audio.  A bounded
@@ -1313,10 +1345,80 @@ pub mod bailian {
 
     #[cfg(test)]
     mod tests {
-        use super::{parse_result_event, parse_start_event, ResultEvent, StartEvent};
+        use super::{
+            parse_result_event, parse_start_event, run_task_payload, run_task_parameters,
+            ResultEvent, StartEvent,
+        };
+        use crate::config::{Config, LlmConfig};
 
         fn event(task_id: &str, event: &str) -> String {
             serde_json::json!({"header": {"task_id": task_id, "event": event}}).to_string()
+        }
+
+        fn cfg_with_threshold(value: f32) -> LlmConfig {
+            LlmConfig {
+                speech_noise_threshold: value,
+                ..Config::default().llm
+            }
+        }
+
+        /// 管理页保存的 `llm.speech_noise_threshold` 必须原样出现在 `run-task`
+        /// 的 `payload.parameters.speech_noise_threshold` 里 —— 这是"云端真的
+        /// 收到用户选的值"的唯一凭据，不能靠读代码推断。
+        #[test]
+        fn speech_noise_threshold_reaches_the_run_task_parameters() {
+            for value in [-1.0_f32, 0.0, 0.3, 0.6, 0.9, 1.0] {
+                let payload =
+                    run_task_payload(&cfg_with_threshold(value), "task-1", serde_json::json!({}), true);
+                assert_eq!(payload["header"]["action"], "run-task");
+                let sent = payload["payload"]["parameters"]["speech_noise_threshold"]
+                    .as_f64()
+                    .expect("阈值必须是数字") as f32;
+                assert_eq!(sent, value, "配置 {value} 没有原样进入 run-task");
+            }
+        }
+
+        /// 越界值（手改 config.toml 或直接 POST /api/config 都能造出来）在
+        /// 下发前必须被钳进官方区间，而不是把云端会拒绝的值原样发出去。
+        #[test]
+        fn out_of_range_thresholds_are_clamped_before_run_task() {
+            assert_eq!(
+                run_task_parameters(&cfg_with_threshold(9.0))["speech_noise_threshold"],
+                serde_json::json!(1.0)
+            );
+            assert_eq!(
+                run_task_parameters(&cfg_with_threshold(-9.0))["speech_noise_threshold"],
+                serde_json::json!(-1.0)
+            );
+            assert_eq!(
+                run_task_parameters(&cfg_with_threshold(f32::NAN))["speech_noise_threshold"],
+                serde_json::json!(0.0)
+            );
+        }
+
+        /// 会话建立后该参数不可改（只能重启会话重发 run-task），所以同一个
+        /// cfg 构造出的参数必须每次都一样；`language_hints` 只影响真实会话。
+        #[test]
+        fn run_task_parameters_are_stable_and_language_hints_are_optional() {
+            let cfg = cfg_with_threshold(0.9);
+            let a = run_task_parameters(&cfg);
+            let b = run_task_parameters(&cfg);
+            assert_eq!(a, b);
+            assert_eq!(a["format"], "pcm");
+            assert_eq!(a["sample_rate"], 16000);
+            assert!(a.get("language_hints").is_none());
+            let real = run_task_payload(&cfg, "t", serde_json::json!({}), true);
+            assert_eq!(real["payload"]["parameters"]["language_hints"][0], "zh");
+            // f32 → JSON 会多出 f64 精度尾巴（0.9f32 == 0.8999999761581421），
+            // 所以这里比 f32 值而不是比 JSON 字面量。
+            assert_eq!(
+                real["payload"]["parameters"]["speech_noise_threshold"]
+                    .as_f64()
+                    .expect("阈值必须是数字") as f32,
+                0.9_f32
+            );
+            let probe = run_task_payload(&cfg, "t", serde_json::json!({}), false);
+            assert!(probe["payload"]["parameters"].get("language_hints").is_none());
         }
 
         #[test]

@@ -90,6 +90,17 @@
     return `rgba(${r},${g},${b},${alpha})`;
   }
 
+  /// `overlay.display_delay_ms` 的合法取值：0 = 关闭缓冲（首个页面到达即显示），
+  /// 或 500–1000 ms 的缓冲窗口。缺省 / 非法值落到 750；负数与 1–499 这类
+  /// "既不是 0 也不在窗口内"的值仍然钳进 500–1000。
+  function clampDisplayDelayMs(value) {
+    if (value === null || value === undefined || value === "") return 750;
+    const ms = Number(value);
+    if (!isFinite(ms)) return 750;
+    if (ms === 0) return 0;
+    return Math.min(1000, Math.max(500, ms));
+  }
+
   /// 0–100 的透明度百分比 → 0.0–1.0 的 alpha。缺省 75。
   function toAlpha(v) {
     let n = Number(v);
@@ -189,6 +200,26 @@
     return best;
   }
 
+  /// 最后一页的起始下标：满足 `full.slice(start)` 仍能塞进一屏的最小 start。
+  /// 修订改写了光标附近的文本、或字号/行数变化导致光标越界时，用它**重新定位
+  /// 光标**而不是把光标打回 0 —— 打回 0 会让字幕从第一页重新出现，观感上就是
+  /// 「第一段字幕和第二段字幕交替闪烁」；光标恰好等于全文长度时还会渲染出空白帧。
+  function findLastPageStart(full, maxH) {
+    let lo = 0;
+    let hi = full.length;
+    let best = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (measureHeight(full.slice(mid)) <= maxH) {
+        best = mid;
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    return best;
+  }
+
   /// 渲染完整累积文本中「当前这句」。
   function renderCaption(full) {
     if (!textEl) return;
@@ -202,8 +233,9 @@
     const lh = parseFloat(getComputedStyle(captionEl).lineHeight) || 0;
     const maxH = maxLines * lh;
     if (maxH <= 0) return full;
-    // 文本被替换成更短的内容时下标会越界，回到开头。
-    if (pageStart > full.length) pageStart = 0;
+    // 修订可能改写光标所在的文本（累计修订的尾巴经常变），文本也可能变短到
+    // 光标越界。这里只**重新定位**光标到"还能装下的最后一页"，绝不推回第 1 页。
+    if (pageStart >= full.length) pageStart = findLastPageStart(full, maxH);
     const cut = findCut(full, pageStart, maxH);
     // Only hand the whole tail over when the tail itself fits on one page.
     // Otherwise render EXACTLY the measured slice: `cut` is the END index of
@@ -213,15 +245,9 @@
     // a page render one character more than was ever measured, which put a
     // third line on screen for cumulative-revision (`replace: true`) streams.
     if (cut >= full.length) return full.slice(pageStart);
-    // `cut <= pageStart` means the cursor no longer belongs to this text (a
-    // revised revision can move the tail). Showing `slice(pageStart, cut)` would
-    // be empty and the old fallback rendered text that is not part of `full` at
-    // all, so restart this sentence from its beginning.
-    if (cut <= pageStart) {
-      pageStart = 0;
-      return full.slice(0, cut);
-    }
     const shown = full.slice(pageStart, cut);
+    // 空页面绝不允许进 DOM —— 一帧空白同样是用户看得见的闪烁。
+    if (!shown) return full.slice(0, cut) || full.slice(0, 1);
     pageStart = cut;
     return shown;
   }
@@ -319,6 +345,13 @@
       textEl.textContent = "";
     }
     if (typePos > typeTarget.length) typePos = typeTarget.length;
+    // 首个单位同步写出：display_delay_ms = 0 承诺「不做任何缓冲」，页面一到达
+    // 就必须看得见，而不是等一个打字间隔（32 / 55 ms）才蹦出第一个字。
+    // 只有第一个单位走这条路径，后面的单位仍按原节奏逐字 / 逐词显示。
+    if (typePos === 0 && typeTarget.length > 0) {
+      typePos = nextUnitEnd(typeTarget, 0);
+      textEl.textContent = typeTarget.slice(0, typePos);
+    }
     if (typePos < typeTarget.length) {
       if (!typeTimer) {
         typeTimer = setTimeout(typeTick, typeMode === "word" ? TYPE_WORD_MS : TYPE_CHAR_MS);
@@ -375,7 +408,7 @@
     if (ov.border_radius !== undefined) style.radius = Number(ov.border_radius) || 0;
     if (ov.max_lines !== undefined) style.maxLines = Number(ov.max_lines) || 2;
     if (ov.display_delay_ms !== undefined) {
-      displayDelayMs = Math.min(1000, Math.max(500, Number(ov.display_delay_ms) || 750));
+      displayDelayMs = clampDisplayDelayMs(ov.display_delay_ms);
     }
     if (ov.clear_after_ms !== undefined) {
       const ms = Number(ov.clear_after_ms);
@@ -496,20 +529,50 @@
     scheduleHide();
   }
 
+  /// 两段修订的公共前缀 / 公共后缀长度。
+  function commonPrefixLength(a, b) {
+    const n = Math.min(a.length, b.length);
+    let i = 0;
+    while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+    return i;
+  }
+
+  function commonSuffixLength(a, b) {
+    const n = Math.min(a.length, b.length);
+    let i = 0;
+    while (i < n && a.charCodeAt(a.length - 1 - i) === b.charCodeAt(b.length - 1 - i)) i++;
+    return i;
+  }
+
+  /// `replace: true` 的帧是服务商对**尚未结束的那一句**的累计修订（百炼
+  /// Fun-ASR：src/llm.rs 里 `sentence_end: true` 才发 Final，其间的 Partial 都是
+  /// 同一句的累计修订），所以一句之内的每一帧都属于同一句 —— 句子的边界是
+  /// `final`（`finalize()` 会清空 partialBuffer），不是某一帧的形状。
+  ///
+  /// 旧判定要求严格前缀兼容，于是真实的二次解码（第 N+1 帧既不是第 N 帧的前缀
+  /// 也不是它的延长：尾字同音修正、句子中间补一个词）会被判成"新的一句"并把翻页
+  /// 光标重置为 0。长句字幕于是退回第一页、下一帧又跳回第二页 —— 就是用户报的
+  /// 「第一段字幕和第二段字幕交替闪烁」。
+  ///
+  /// 现在只把"明显是新的一句"当作新的一句：帧长还不到上一帧的一半（新句子总是
+  /// 从小片段重新长起来），或者与上一帧几乎不共享任何文本。真正的新一句仍然从
+  /// 第一页开始；修订导致光标越界时由 pickShown() 重新定位到最后一页，不会回到
+  /// 第一页。
+  function sameOpenSentence(prev, next) {
+    if (!prev || !next) return false;
+    if (next.startsWith(prev) || prev.startsWith(next)) return true;
+    if (next.length * 2 < prev.length) return false; // 重新从小片段长起来 = 新的一句
+    const shorter = Math.min(prev.length, next.length);
+    const shared = commonPrefixLength(prev, next) + commonSuffixLength(prev, next);
+    // 短帧只要沾一点边就算同一句；长帧要求共享至少四分之一，避免把完全无关的
+    // 同长度文本误判为同一句。
+    return shorter < 8 ? shared > 0 : shared * 4 >= shorter;
+  }
+
   function replacePartial(text) {
     // Bailian partial results are cumulative revisions, not deltas.
     const next = text || "";
-    // Same sentence only while one revision is an extension of the other.
-    // `next.startsWith(partialBuffer)` alone is not enough: real ASR revisions
-    // also shift text near the tail (frame N is neither equal to nor a prefix of
-    // frame N+1), and treating those as "same page" left `pageStart` past the
-    // end of the new text so the caption rendered the PREVIOUS sentence's tail.
-    // Either direction counts as the same sentence (growth, or a trim of the
-    // same text); anything else starts a new one.
-    const sameSentence =
-      partialBuffer.length > 0 &&
-      (next.startsWith(partialBuffer) || partialBuffer.startsWith(next));
-    if (!sameSentence) pageStart = 0;
+    if (!sameOpenSentence(partialBuffer, next)) pageStart = 0;
     partialBuffer = next;
     show(partialBuffer);
     scheduleHide();

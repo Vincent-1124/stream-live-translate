@@ -94,13 +94,13 @@
   另：该脚本与 `extract-replay-samples.ps1`、`candidate-control/Start-Candidate-Control.ps1` 原先都是**无 BOM 的 UTF-8**，而 `powershell.exe`(5.1) 在本机 code page 936 下按 GBK 解码，中文会变乱码并**直接导致语法错误**（`Unexpected token '}'`）。三者已改为 **ASCII-only 源码**并经 PS 5.1 解析器验证；`extract-replay-samples.ps1` 另加 `-Ffmpeg` 全路径参数（本机 ffmpeg 不在 PATH）与 `-Force`。
 - **注意**：`candidate-control/` 的启动脚本现会在写 `candidate-control.pid` **之前**校验该 PID 仍存活且已拥有 8797 端口，否则删除 pid 文件并非 0 退出——此前端口绑定失败已退出的实例也会被写进 pid 文件，制造"幽灵 PID"。
 
-## 已确认的缺口（2026-09-21 同源复核，详见工作区 `docs/10-同源复核记录-2026-09-21.md`）> 本节是 **15:54 那次复核的历史记录**，条目原样保留。其中清屏时长、输入音量表、预览 `replace`、云端断线自愈、drain 竞态、无音频空会话六条已在本轮被处理，均在条目末尾用「2026-09-21 16:0x 更正」标注；这些更正**没有任何运行证据**（16:07:32 的 `target/release` 构建在时间上覆盖了它们，但无构建记录、无 commit 绑定、无运行验证），不得当作"已验证"。仍然成立的是：热词完全未实现、三档预设不影响 `speech_noise_threshold`、门控缺少句首/句尾预留与 Music 帧静音补偿。**死副本 `src/overlay/` 已在 16:03–16:05 之间被删除**（见下方更正），本条不再成立。
+## 已确认的缺口（2026-09-21 同源复核，详见工作区 `docs/10-同源复核记录-2026-09-21.md`）> 本节是 **15:54 那次复核的历史记录**，条目原样保留。其中清屏时长、输入音量表、预览 `replace`、云端断线自愈、drain 竞态、无音频空会话六条已在本轮被处理，均在条目末尾用「2026-09-21 16:0x 更正」标注；这些更正**没有任何运行证据**（16:07:32 的 `target/release` 构建在时间上覆盖了它们，但无构建记录、无 commit 绑定、无运行验证），不得当作"已验证"。仍然成立的是：热词完全未实现、三档预设不影响 `speech_noise_threshold`、门控缺少句首/句尾预留与 Music 帧静音补偿。**死副本 `src/overlay/` 已在 16:03–16:05 之间被删除**（见下方更正），本条不再成立。**（2026-09-21 22:0x 再更正：热词已实现并验收（见文末 R10 节）；三档预设现已写 `speech_noise_threshold`（见文末 22:0x 节）——"仍然成立"的三条里两条已闭合，只剩门控预留未做。）**
 
 - **R10 热词完全未实现**：源码与前端均无任何词表字段或界面，`run-task` 参数不含词表。此前把它列入“未执行”是不准确的。**（2026-09-21 18:0x 更正：已实现并已用真实百炼调用验收，见文末「R10 热词（上下文增强）实现与真实对照实验」；机制全部通过，但目标专名的纠正效果**实测未出现**——该节记录了两组原始字幕文本，不得据此宣称"热词已能纠正专名"。）**
 - **云端识别断线不会自动重连**：`watch()` 只检查配置、采集设备与 `audio_active`，从不检查 `llm_connected`；百炼 provider 只连接一次。WebSocket 断开后管线停摆且不自愈。**（2026-09-21 16:02 更正：`watch()` 已新增 provider 任务结束检测与自动重连；16:3x 补充：重连改为按连续失败次数指数退避 2→80 s 封顶，不再是无上限的固定 2 s。仍属代码级，未跑真实链路。）**
 - **音频断开触发的重启会打断最终结果 drain**：`watch()` 的 2 秒 ticker 在 `close_input()` 后立刻 `restart()`，而 `restart()` 会 abort LLM 任务，使 `87b9f6e` 的 10 秒 drain 实际只剩约 2 秒。**（2026-09-21 16:02 更正：`restart(drain_grace)` 已在 provider 仍存活时改为推迟拆机；16:3x 进一步更正：grace 提到 12 s 并改为"等 drain 自己结束"而非到点 abort，因为 2 s 的版本仍会丢掉 2 秒后才到的最终句。）**
 - **重启会立刻新开无音频的云任务**：`try_start` 不问音频是否到达就置 `audio_active=true`，provider 随即 `run-task`；这解释了 23 秒超时的来源。**（2026-09-21 16:03 更正：`try_start` 已不再置 `audio_active=true`，改由首帧真实音频置真，并加了 2 秒停滞检测。2026-09-21 16:3x 进一步更正：现由 `AUDIO_FIRST_FRAME_GRACE = 30 s` + **能量阈值**门控决定何时建云会话，静音输入不再建会话；例外是用户显式点击的 `/api/connection-test`，它会建立一个空任务探测鉴权。见下文「自愈与 drain 修复」。）**
-- **三档过滤预设不影响送往云端的音频**：预设只改本地 `silence_rms`，而 `Speech` 与 `Silence` 帧都会发送、只丢弃 `Music` 帧；`02` 号文档要求的 `speech_noise_threshold` 未被任何预设或界面改动，也无回放校准记录。
+- **三档过滤预设不影响送往云端的音频**：预设只改本地 `silence_rms`，而 `Speech` 与 `Silence` 帧都会发送、只丢弃 `Music` 帧；`02` 号文档要求的 `speech_noise_threshold` 未被任何预设或界面改动，也无回放校准记录。**（2026-09-21 22:0x 更正：预设现已同时写 `llm.speech_noise_threshold` 并在管理页提供数值输入 + 四个快捷档位，见文末「云端噪声判定阈值 `speech_noise_threshold` 做成用户可调项」。**注意**：本条前半段对 `pipeline.rs` 的描述（Speech/Silence 都发、只丢 Music）**仍然成立**，它正是"只改 `silence_rms` 没用、必须改云端阈值"的原因；已闭合的是"没有任何界面入口"这一半。"降噪实效"仍无实测数据。）**
 - **R06 清屏时长不可配置**：`overlay/app.js` 中为硬编码 4000 ms，配置与管理页均无对应字段。**（2026-09-21 16:0x 更正：已实现 `overlay.clear_after_ms` 并在管理页给出 2–8 秒选项，见「本轮改动」；仍属代码级，未在浏览器验证。）**
 - **门控缺少约定的句首/句尾预留与静音替换**：无 200/300 ms 预留，`Music` 帧直接丢弃、不补同长度静音。
 - **管理页输入音量表只在页面打开、保存后与重启后刷新**：没有轮询，WebSocket 也不推送 `input_level`；且只显示 `sqrt(rms)` 百分比。**（2026-09-21 16:0x 更正：已加 1 秒轮询与 RMS 数值读数，见「本轮改动」；仍属代码级，未在浏览器/OBS dock 验证。）**
@@ -204,3 +204,165 @@
 - `cargo test --bin stream-live-translate` = **48 passed / 0 failed**。
 - 为释放文件占用，验证期间停止了 `candidate-control` 里残留的引擎进程与一个
   2026-09-20 起由 OBS 插件启动的旧引擎；两者均可用原方式重新拉起。
+
+## 2026-09-22 本轮前端 / 配置改动（0 秒无缓冲、长句翻页闪烁、管理页控件审计）
+
+> 全部结论来自可离线复现的命令（原始输出见 `docs/ACCEPTANCE_LOG.md`）。
+> 未触碰 `src/pipeline.rs`、`src/llm.rs`、`src/ingest.rs`、`src/hotwords.rs`、`src/obs.rs`、`src/main.rs`；
+> 任务 1 在 `src/config.rs`、`src/server.rs` 内只动了 `display_delay_ms` 相关部分。
+
+### 1. 新增「0 秒（无缓冲）」选项（`overlay.display_delay_ms = 0`）
+
+- `admin/index.html`：`#ov-display-delay` 新增 `<option value="0">0 秒（无缓冲）</option>` + 字段说明。
+- `admin/app.js`：新增 `clampDisplayDelay()`（0 = 无缓冲；其余钳到 500–1000；缺省 750）与
+  `setSelectValue()`（未列出的合法值不再让下拉框变空白、并在下次保存时被改写成默认值）。
+  `fillForm()` 用 `?? 750` 取代 `|| 750`（**旧写法把 0 变回 750**），
+  `collectPatch()` 不再用 `Math.max(500, …)`（**旧写法把 0 变回 500**）。
+- `src/config.rs`：新增 `clamp_display_delay_ms()`（`None`→750、`Some(0)`→0、其余 500–1000）
+  与 `DISPLAY_DELAY_MIN_MS/MAX_MS`；新增单测 `display_delay_allows_zero_and_clamps_the_rest`
+  （含 0 的 TOML 往返），`OverlayConfig::display_delay_ms` 的文档注释同步。
+- `src/server.rs`：`GET /api/config` 与 WS `config` 推送都走同一函数，两条路径下发值一致。
+- `overlay/app.js`：`clampDisplayDelayMs()` 允许 0；0 时**不创建任何显示定时器**（真·无缓冲）；
+  typewriter 路径的首个单位改为同步写出，0 缓冲下第一个字不再额外等 32 ms。
+- `dist/admin`、`dist/overlay` 已同步（`build.rs` 构建时也会自动同步；二进制 embed `dist/`）。
+
+### 2. 修「长句翻页时第一段/第二段交替闪烁」（REAL DEFECT #4）
+
+- 根因：`replacePartial()` 只在「一帧是另一帧的前缀」时才算同一句。百炼 Fun-ASR 的
+  `replace:true` 帧是对**同一句**的累计修订（句子边界是 `sentence_end:true` → `Final`），
+  真实的尾字同音修正 / 句中补词既不前缀也不延长 ⇒ 每帧都被判成「新的一句」并把翻页光标重置为 0
+  ⇒ 长句在第 1 页与第 2 页之间来回跳。
+- 修复：`sameOpenSentence()`（按两帧共享文本比例判定同一句）+ `pickShown()` 用
+  `findLastPageStart()` **重新定位**光标而非推回第 0 页（并修掉 `pageStart === full.length` 的空白帧）。
+- 复现脚本 `node tests/repro-page-flicker.mjs`：S1 纯增长 0 次、S2 尾字重解码 10 次、
+  S3 句中补词 1 次、S4 打字机 10 次 → **修复前 21 次回退（exit 1）**，**修复后 0 次（exit 0）**。
+- 回归用例：`page-flicker`、`page-flicker-typewriter`（新），负控制新增 `page-cursor-reset` /
+  `page-cursor-restart` 扰动，两个用例都会重新失败。
+- 另加 `local-replay` 用例：把假时钟推过 `?local-replay=1` 内置调试路径的完整 12 s 时间线，
+  断言无空白帧、无第三行、每页都属于当前句、完成标记到达、长样本确实向前翻页、结束后清屏。
+
+### 3. 管理页控件审计（逐项表见 `docs/ACCEPTANCE_LOG.md`）
+
+56 个控件全部有后端支撑；3 项此前有缺陷，已修：
+
+1. 「新字幕页显示缓冲」= 0 被前端改回 500 / 750（已修，见上）。
+2. 实时预览分页把 `previewFindCut()` 的**结束下标当起始下标**用，渲染整句尾巴（超出两行预览框、
+   永远看不到真正的第一页）；已改为与 overlay 同一套 `pickShown()` 语义（含同一句判定）。
+3. 「清空历史」只清本页导入行，服务端历史没有对应接口，点完列表照旧 ⇒ 新增
+   `POST /api/subtitles/history/clear`（`SubtitleHub::clear_history()` + 单测），按钮改为调用它
+   并校验 `ok`；`/api/recordings/export` 的本场录制不受影响。
+
+不确定是否算 bug、留给你判断：`#support-btn`（只弹「暂未开放」，无后端）、配置里出现下拉列表
+之外的服务商名时保存会改写为 `openai-realtime`、`/api/locale` 已无前端调用者、
+`GET /api/config` 明文返回 `obs.password`（默认只监听 127.0.0.1）。
+
+### 4. 本轮测试数字
+
+`node tests/run-overlay-tests.mjs` = **25 passed / 0 failed**（基线 21）；
+`node tests/run-negative-control.mjs` = **PASSED**（7 个扰动全部被捕获）；
+`cargo test --offline`（隔离工具链）= **50 passed / 0 failed**。
+原始输出存档在 `evidence/`（工作区根目录）。
+
+## 2026-09-21 22:0x 追加：云端噪声判定阈值 `speech_noise_threshold` 做成用户可调项
+
+> 目标：把官方 `fun-asr-realtime` 的 `run-task.parameters.speech_noise_threshold`
+> 暴露到管理页，并让「过滤预设」真正影响识别结果。**本轮没有跑任何校准或整场回放**，
+> 0.3 / 0.6 两档没有实测数据（用户明确要求不要为填这两档做实验）。
+
+### 为什么原来的预设几乎无效
+
+`src/pipeline.rs` 把 `Speech` 与 `Silence` 帧**都**发给云端、只丢 `Music`，所以预设只改
+本地 `filter.silence_rms` 时，送往云端的音频基本不变 ⇒ 识别结果几乎不变（原「已确认的缺口」
+第 3 条的结论成立）。真正影响识别的是随 `run-task` 下发的 `speech_noise_threshold`，
+而它此前既无界面入口也无预设。**该缺口本轮已闭合（代码级 + 本地 HTTP 证据，见下）。**
+
+### 最终设计：一个预设同时设置两个值（不拆成两个控件）
+
+「过滤预设」保持**单一入口**，但每个档位现在**同时**写 `llm.speech_noise_threshold`（云端）
+与 `filter.silence_rms`（本地），两个数值输入都留在界面上并实时回显：
+
+| 预设（下拉 + 快捷按钮） | `speech_noise_threshold` | `filter.silence_rms` |
+|---|---|---|
+| 0.0 关（保留轻声）`soft` | 0.0 | 0.007 |
+| 0.3 中等（平衡）`balanced` | 0.3 | 0.012 |
+| 0.6 较强 `straight` | 0.6 | 0.012 |
+| 0.9 强（强过滤）`strong` | 0.9 | 0.012 |
+| 自定义 `custom` | 读输入框 | 读输入框（此档才显示） |
+
+理由：用户面对的是「降噪强度」这一个取舍，两个数值是实现细节；拆成两个预设会把同一个
+取舍变成两套互相打架的选择。副作用是原来的 `strong`（`silence_rms = 0.020`）不再改本地
+阈值（0.020 会切掉轻声），「强过滤」的语义改为由**云端阈值**承担 —— 这是有意的：本地阈值
+越狠丢的帧越多、且不会减少噪声幻觉，真正能压掉幻觉的是云端阈值。
+
+### 文件级改动
+
+- `src/config.rs`：新增 `SPEECH_NOISE_THRESHOLD_MIN/MAX = -1.0/1.0`、
+  `clamp_speech_noise_threshold()`、`clamp_speech_noise_threshold_flagged()`；字段文档补齐
+  取值方向与代价。新增 2 项单测（钳制/NaN/±inf + 六个合法值 TOML 往返）。
+- `src/llm.rs`：把 `run-task` 的 `payload.parameters` 抽成 `run_task_parameters(cfg)`、
+  首帧抽成 `run_task_payload(cfg, task_id, input, language_hints)`，**真实会话 `run()` 与
+  `test_connection()` 共用同一份构造**（此前是两处各写一遍 `serde_json::json!`），并在下发前
+  再钳一次。新增 3 项单测，其中包括「配置值原样出现在 `run-task` 参数里」。
+- `src/server.rs`：`POST /api/config` 写盘前钳制并在越界时打日志；`GET /api/config` 回传
+  钳制后的 `llm.speech_noise_threshold` 与 `llm.speech_noise_threshold_clamped`；
+  `/api/status` 新增 `speech_noise_threshold` / `speech_noise_threshold_clamped`。
+  新增 2 项单测（`merge_json` 补丁往返、钳制一致性）。
+- `src/main.rs`：`AppState` 新增运行期标记 `speech_noise_threshold_clamped`。
+  **必须单独记**：钳过之后磁盘里存的就是边界值，"用户填的是 5.0"这件事再也看不出来，
+  管理页要如实提示只能靠这个标记（下次保存合法值时清零）。
+- `admin/index.html`、`admin/app.js`、`admin/style.css`：新增数值输入
+  `#speech-noise-threshold`（`type=number min=-1 max=1 step=0.1`）、四个快捷档位按钮
+  `#noise-preset-buttons`、「当前生效值」行 `#noise-threshold-status`、非百炼通道提示
+  `#noise-provider-hint`；预设下拉扩到 4 档 + 自定义；`silence_rms` 行改为「自定义」档才显示。
+- `dist/admin/*`：与源目录同步（SHA-256 逐一相同，见 `docs/ACCEPTANCE_LOG.md`）。
+- `tests/admin-preset-cases.mjs`（新增）：用 `tests/dom-shim.mjs` + `node:vm` 起一个无头管理页，
+  断言 15 项前端契约（输入属性、回填、四档双值联动、保存 patch 带阈值、越界钳制、
+  手改回落「自定义」、生效值提示、输入框清空不谎报、非百炼提示）。
+
+### 界面上说清的两件事
+
+1. **代价**：数值输入下方写明「越低越容易把环境噪声当语音转写，越高越容易把主讲人的话判成
+   噪声、断句也会更碎」。
+2. **生效方式**：写明该参数在云端 `run-task` 时下发、**保存配置后会重启识别会话**；
+   「当前生效值」行在输入框与服务端生效值不一致时显示「输入框 X 尚未生效：保存配置后会在
+   重启识别会话时下发」。**界面上没有标注任何"实测/未实测"字样**（按用户决定删除）。
+
+### 本轮证据（全部本机离线，未使用任何真实 API Key）
+
+- `cargo test --offline` = **57 passed / 0 failed**（本轮新增 7 项；基线 50）。
+- `node tests/admin-preset-cases.mjs` = **15/15 passed**。
+- 自测引擎（8897 端口、mock provider、独立 config 副本，未触碰 8787/8788/8797/8798）：
+  真实 `GET /api/config` 读出 `speech_noise_threshold`；`POST` 0.9 → 读回
+  `0.8999999761581421`（f32）；`POST` 5.0 → 读回 `1` 且 `clamped = true`；
+  `POST` −9.0 → 读回 `−1`；再存 0.9 后 `clamped` 清零；`/api/status` 读出 0.9；
+  `/admin` 返回的 HTML 里 6 个新控件标记全部 FOUND。原始输出：
+  `.build-tools/selftest-8897/evidence.txt`。
+- 旧配置兼容：删掉 `speech_noise_threshold` 整行的 `config.toml` 在 8899 上正常启动，
+  `/api/config` 与 `/api/status` 都读出默认 0.0。
+- `node --check`：`admin/app.js`、`overlay/app.js`、`tests/*.mjs` 全部 exit 0。
+- `node tests/run-overlay-tests.mjs` = **25 passed / 0 failed**；
+  `node tests/run-negative-control.mjs` = **PASSED**（overlay 未改动，结果与基线一致）。
+
+### 明确未验证
+
+- **0.3 / 0.6 两档没有任何实测数据**（本轮按用户要求不做校准回放）。
+- 阈值对**真实百炼**识别结果的影响（垃圾字幕条数、断句碎度）本轮未测：`run-task` 参数
+  只由单元测试断言，未用真实端点抓包。
+- 面板在**真实浏览器 / OBS dock** 里的观感（快捷按钮高亮、`silence_rms` 行的显隐、
+  「当前生效值」与 1 秒轮询的配合）未在浏览器验证 —— 只有无头 DOM 断言。
+- 非百炼通道的提示文案只是界面提示，未逐通道实测。
+- 界面不标注任何"实测/未实测"字样（用户明确要求），因此用户看不到哪些值有实测数据。
+
+### 文档事故（必须知悉）
+
+写入本节时，`docs/ACCEPTANCE_LOG.md` **丢失了一节未提交内容**：「2026-09-22 追加：前端 / 配置
+三项任务（0 秒无缓冲、长句翻页闪烁、管理页控件审计）」，含 59 项管理页控件审计表与
+`node --check` / `dist` 哈希 / 密钥扫描记录。原因是误用 `git checkout -- docs/ACCEPTANCE_LOG.md`
+去处理一份带未提交改动的文档，工作区内无副本，无法恢复。
+
+- **未丢**：前端改动本身（`admin/*`、`overlay/*`、`tests/*`、`src/subtitle.rs` 等）都还在磁盘上。
+- **已丢**：那份审计表与其中的哈希/扫描记录，需要重新生成。
+- **教训**：对带未提交改动的文件**不要**用 `git checkout --`；本次同一类操作还曾把 `src/llm.rs`
+  的 UTF-8 编码改成 BOM+GBK 乱码（`Set-Content -Encoding UTF8` 在 PS 5.1 下按 ANSI 读入），
+  该文件已 `git checkout` 回 HEAD 后用编辑工具重新应用（`src/llm.rs` 当时无未提交改动，故无损失）。
+

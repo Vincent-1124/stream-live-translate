@@ -78,7 +78,20 @@ tests. A copy could not detect a regression in the real code.
 | `geometry-1600` / `geometry-800` | the same sweep at browser-source widths 1600 px and 800 px (800 px = 15 CJK chars/line, more cuts). |
 | `max-lines-6` | a server config asking for `max_lines: 6` still yields a 2-line viewport and paging, never a third line. |
 | `max-lines-1` | `max_lines: 1` keeps strict single-line mode (`single-line` class, one-line viewport). |
-| `typewriter` | with `animation: typewriter`, every intermediate typewriter frame is still <= 2 lines and the page still advances (the typewriter's `TYPE_CATCHUP_UNITS` path is exercised). |
+| `typewriter` | with `animation: typewriter`, every page handed to `displayShown()` is still <= 2 lines, the page is a contiguous slice of the streamed sentence, the page advances (furthest page start > 0) and it never moves backwards. The page is read from an in-memory render log, because `textContent` is only a typed *prefix* of the page while the animation runs. |
+
+### A1f — page stability (the long-sentence flicker)
+
+| id | assertion |
+| --- | --- |
+| `page-flicker` | for three one-sentence streams (tail re-decoded every 6th frame, a word inserted mid-sentence, and pure growth as a control): every rendered page is a contiguous window of the **current** revision, never needs a 3rd line, the sentence pages forward, and the window **never moves backwards**. A final sub-check trims a paged sentence back to 100 chars (still more than one page) and requires the caption to show the newest words (last page, no empty frame, no fall back to page 1). |
+| `page-flicker-typewriter` | the same four streams with `animation: typewriter` (the shipped default). |
+
+### A6 — the overlay's own debug/replay path
+
+| id | assertion |
+| --- | --- |
+| `local-replay` | loading the overlay with `?local-replay=1` and driving the fake clock over the whole 12 s timeline renders no empty page, never a 3rd line, every rendered page is part of the current line, the completion marker (`<body data-local-replay="complete">`) is reached, a page turn happens for the long sample (driven through `resize()`, which is how a real browser re-renders after the fonts load), and the caption is cleared again once the replay goes silent. |
 
 ### A3 — display buffer semantics
 
@@ -86,6 +99,7 @@ tests. A copy could not detect a regression in the real code.
 | --- | --- |
 | `buffer` | the first partial of a page is delayed by `display_delay_ms`; a partial arriving **inside** the buffer replaces the queued text and does **not** re-arm the timer (the deadline keeps counting down: 750 -> 450 -> 50 ms remaining); at 749 ms nothing is shown, at 750 ms the **latest** text appears; after the page is live, later partials update immediately. |
 | `delay-config` | `display_delay_ms` is configurable and clamps to `[500, 1000]` (500 shows at exactly 500 ms; an out-of-range value lands at 1000 ms). |
+| `delay-zero` | `display_delay_ms = 0` is a real "no buffer" mode: the text is visible in the same tick the event arrives, **no** display timer is created (the only new one-shot timer is the silence clear), the page after a silence clear is also unbuffered, and on the typewriter path the first unit is written synchronously (no 32 ms wait). Clamping: `0 -> 0`, `250 -> 500`, `-100 -> 500`, `100000 -> 1000`. |
 
 ### A4 — clear-after-silence
 
@@ -114,10 +128,13 @@ every perturbation is caught by at least one case that passes in the baseline.
 
 | perturbation | what it breaks | caught by |
 | --- | --- | --- |
-| `two-line-cap` | `if (lines > 2) lines = 2;` -> `lines = 4;` | 8 cases (`shim-geometry`, `shim-latin`, `delta-stream`, `geometry-1600`, `geometry-800`, `max-lines-6`, `max-lines-1`, `typewriter`) |
-| `buffer-semantics` | `show()` re-arms the display timer on every buffered partial | `buffer` |
-| `replace-semantics` | `replacePartial()` appends the revision instead of replacing the buffer | `clear-live`, `clear-config`, `replace-semantics` |
-| `page-boundary-regression` | `pickShown()` renders from `pageStart` to the end again (the historical off-by-one) | `delta-stream`, `replace-stream`, `replay-*`, `geometry-*`, `max-lines-6`, `typewriter` |
+| `two-line-cap` | `if (lines > 2) lines = 2;` -> `lines = 4;` | 14 cases (incl. `local-replay`) |
+| `buffer-semantics` | `show()` re-arms the display timer on every buffered partial | `buffer`, `local-replay` |
+| `replace-semantics` | `replacePartial()` appends the revision instead of replacing the buffer | `replace-stream`, `shifting-revision`, `page-flicker`, `page-flicker-typewriter`, `clear-live`, `clear-config`, `replace-semantics`, `typewriter` |
+| `page-boundary-regression` | `pickShown()` renders from `pageStart` to the end again (the historical off-by-one) | 12 cases, incl. `page-flicker`, `local-replay` |
+| `page-cursor-reset` | `sameOpenSentence()` requires strict prefix compatibility again (a re-decoded frame = "new sentence") — the page-1 / page-2 flicker | `page-flicker`, `page-flicker-typewriter` |
+| `page-cursor-restart` | `pickShown()` restarts the cursor at 0 instead of rebasing onto the last page that fits | `page-flicker`, `page-flicker-typewriter` |
+| `delay-zero-clamp` | `clampDisplayDelayMs()` clamps `0` up to 500 ms again (no more "no buffer") | `delay-zero` |
 
 ---
 
@@ -192,7 +209,7 @@ default (it is no longer gated):
 3. a shifting cumulative revision still pages forward.
 
 ```bash
-node tests/run-overlay-tests.mjs      # 21 passed / 0 failed
+node tests/run-overlay-tests.mjs      # 25 passed / 0 failed
 ```
 
 `OVERLAY_TEST_OPEN_ISSUES=1` is no longer needed and is ignored.
@@ -238,6 +255,64 @@ tail (`"…整段重"` → `"…整段重新"`) is neither a prefix nor an exten
 keeping the old `pageStart` could leave the cursor outside the new text. The
 check is now symmetric (either revision being a prefix of the other keeps the
 page; anything else restarts the sentence), and the case above covers it.
+
+---
+
+## REAL DEFECT #4 — long-sentence page flicker (reported by the user, fixed)
+
+> 「当一句话比较长时出第二段字幕的时候第一段字幕可能会和第二段字幕交替闪烁」
+
+**Symptom.** A long sentence that needs a second page shows page 2, then page 1
+again, then page 2 … — the two segments alternate on screen.
+
+**Mechanism.** `replace: true` frames are cumulative revisions of the provider's
+*open* sentence (Bailian Fun-ASR: `src/llm.rs` pushes `SubtitleEvent::Replace`
+for every partial and only `sentence_end: true` produces a `Final`). Real ASR
+re-decodes the tail (homophone/punctuation) and can insert a word mid-sentence,
+so frame N+1 is frequently neither an equal, a prefix, nor an extension of
+frame N. The same-sentence predicate above — symmetric *prefix* compatibility —
+classified every such frame as a **new sentence** and ran `pageStart = 0`.
+
+The flicker is one frame wide, which is why reading the cursor *after* the
+render hides it: `pickShown()` immediately re-cuts page 1 and advances `pageStart`
+to 62 again before the frame returns, but the **text handed to the DOM for that
+frame was page 1**. `repro-page-flicker.mjs` therefore records what was actually
+rendered instead of the end-of-frame cursor.
+
+**Fix (`overlay/app.js`).**
+* `sameOpenSentence(prev, next)` keeps the page cursor for the whole open
+  sentence: a frame that is a prefix/extension in either direction, or that
+  still shares enough text (not less than half the length of the shorter frame,
+  and not less than a quarter of it once the frames are long) is the same
+  sentence. Only a frame that clearly restarts — much shorter than the previous
+  one, or sharing next to nothing — resets to page 1.
+* `pickShown()` **rebases** the cursor with `findLastPageStart()` when a revision
+  leaves it at/past the end of the text (the cursor used to be pushed back to 0,
+  and `pageStart === full.length` rendered an empty caption for a frame).
+* `displayShown()` writes the first typewriter unit synchronously, so
+  `display_delay_ms = 0` is genuinely immediate on the typewriter path too.
+
+**Evidence.**
+
+```bash
+node tests/repro-page-flicker.mjs                    # S1 growth 0 / S2 tail re-decode 10 /
+                                                     # S3 mid-sentence insert 1 / S4 typewriter 10
+                                                     # pre-fix: 21 backward page moves, exit 1
+node tests/run-negative-control.mjs page-cursor-reset   # the new cases fail again
+node tests/repro-page-flicker.mjs                    # post-fix: 0 backward page moves, exit 0
+```
+
+---
+
+## `display_delay_ms = 0` (「0 秒（无缓冲）」)
+
+The panel offers 0 as "no buffer". It is a legal value on every layer:
+`overlay/app.js:clampDisplayDelayMs()` (0, or 500–1000; missing/garbage -> 750),
+`src/config.rs:clamp_display_delay_ms()` (identical rule, used by both
+`GET /api/config` and the WebSocket `config` push), and the admin panel
+(`clampDisplayDelay()` + `setSelectValue()`, because `value || 750` and
+`Math.max(500, …)` both used to turn 0 back into a buffer). With 0 no display
+timer is created at all. `A3c` (case id `delay-zero`) pins it.
 
 ---
 
@@ -315,5 +390,5 @@ page; anything else restarts the sentence), and the case above covers it.
 | line height | 1.25 -> 60 px | `overlay/style.css:52` |
 | two-line viewport | 120 px | `2 x 60` |
 | CJK chars per line / page | 31 / 62 | derived |
-| `display_delay_ms` | 750 (clamped 500–1000) | `overlay/app.js` |
+| `display_delay_ms` | 750 (0 = no buffer, otherwise clamped 500–1000) | `overlay/app.js`, `src/config.rs`, `src/server.rs` |
 | `clear_after_ms` | 4000 (clamped 1000–15000) | `overlay/app.js`, `src/config.rs` |

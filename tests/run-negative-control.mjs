@@ -10,10 +10,16 @@
 // least one previously-passing assertion fail.
 //
 // Perturbations:
-//   two-line-cap     if (lines > 2) lines = 2;   ->   lines = 4;
-//   buffer-semantics show(): always re-arm the display timer (deadline extends)
-//   replace-semantics replacePartial(): append instead of replacing
-//   all              run all three (default)
+//   two-line-cap             if (lines > 2) lines = 2;   ->   lines = 4;
+//   buffer-semantics         show(): always re-arm the display timer (deadline extends)
+//   replace-semantics        replacePartial(): append instead of replacing
+//   page-boundary-regression pickShown(): return the tail from pageStart (historical off-by-one)
+//   page-cursor-reset        sameOpenSentence(): strict prefix compatibility again
+//                            (the page-1 / page-2 flicker, user report #2)
+//   page-cursor-restart      pickShown(): `pageStart >= full.length` -> `> ... = 0`
+//                            (cursor restart instead of rebasing onto the last page)
+//   delay-zero-clamp         clampDisplayDelayMs(): 0 is no longer "no buffer"
+//   all                      run every perturbation (default)
 
 import fs from "node:fs";
 import path from "node:path";
@@ -64,15 +70,55 @@ export const PERTURBATIONS = {
       "pickShown(): render from pageStart to the end again (the historical off-by-one)",
     apply(src) {
       const from = [
-        "    if (cut >= full.length) return full.slice(pageStart);",
         "    const shown = full.slice(pageStart, cut);",
-        "    // Guard against an empty page if a caller hands us a stale pageStart.",
+        "    // 空页面绝不允许进 DOM —— 一帧空白同样是用户看得见的闪烁。",
         "    if (!shown) return full.slice(0, cut) || full.slice(0, 1);",
         "    pageStart = cut;",
         "    return shown;",
       ].join("\n");
       if (!src.includes(from)) throw new Error(`anchor not found: ${JSON.stringify(from)}`);
       return src.replace(from, "    return full.slice(pageStart);");
+    },
+  },
+  // Regression guard for the long-sentence page flicker (user report #2).  The
+  // historical rule was strict prefix compatibility, which reset the page cursor
+  // to 0 on every real ASR re-decode of the open sentence.
+  "page-cursor-reset": {
+    description:
+      "sameOpenSentence(): require strict prefix compatibility again (a re-decoded frame = new sentence)",
+    apply(src) {
+      const from = [
+        "    if (next.startsWith(prev) || prev.startsWith(next)) return true;",
+        "    if (next.length * 2 < prev.length) return false; // 重新从小片段长起来 = 新的一句",
+        "    const shorter = Math.min(prev.length, next.length);",
+        "    const shared = commonPrefixLength(prev, next) + commonSuffixLength(prev, next);",
+        "    // 短帧只要沾一点边就算同一句；长帧要求共享至少四分之一，避免把完全无关的",
+        "    // 同长度文本误判为同一句。",
+        "    return shorter < 8 ? shared > 0 : shared * 4 >= shorter;",
+      ].join("\n");
+      if (!src.includes(from)) throw new Error(`anchor not found: ${JSON.stringify(from)}`);
+      return src.replace(from, "    return next.startsWith(prev) || prev.startsWith(next);");
+    },
+  },
+  // Regression guard for the rebase: a revision that shortens the sentence under
+  // the page cursor must move the cursor onto the LAST page that still fits,
+  // never restart it at page 1 and never render an empty page.
+  "page-cursor-restart": {
+    description:
+      "pickShown(): `pageStart >= full.length` -> `pageStart > full.length` + reset to 0",
+    apply(src) {
+      const from = "    if (pageStart >= full.length) pageStart = findLastPageStart(full, maxH);";
+      if (!src.includes(from)) throw new Error(`anchor not found: ${JSON.stringify(from)}`);
+      return src.replace(from, "    if (pageStart > full.length) pageStart = 0;");
+    },
+  },
+  // Regression guard for the new "0 秒（无缓冲）" option.
+  "delay-zero-clamp": {
+    description: "clampDisplayDelayMs(): 0 goes back to being clamped up to 500 ms",
+    apply(src) {
+      const from = "    if (ms === 0) return 0;";
+      if (!src.includes(from)) throw new Error(`anchor not found: ${JSON.stringify(from)}`);
+      return src.replace(from, "    if (ms === 0) return 500;");
     },
   },
 };

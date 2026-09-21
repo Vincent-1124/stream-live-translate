@@ -84,8 +84,21 @@ pub struct LlmConfig {
     /// always wins.
     #[serde(default)]
     pub workspace_id: String,
-    /// Bailian server-side speech/noise sensitivity.  The value is deliberately
-    /// configurable because it must be calibrated against the actual mic.
+    /// 百炼 `run-task.parameters.speech_noise_threshold`：语音/噪音判定阈值。
+    ///
+    /// 只对 `bailian-fun-asr` 生效，随 `run-task` 下发，因此改动它**必须重启
+    /// 识别会话**（管理页保存后会自动重启）。
+    ///
+    /// 取舍（2026-09-21 实测，63.7 分钟同一场直播、同一二进制、只改此值）：
+    /// * `0.0` —— 忠实模式。观众欢呼段（30–55 s）产生 5 条垃圾字幕
+    ///   （`他实习。` / `谢。` / `这不可。` / `人做好。` / `That just.`），
+    ///   整场 344 条 final / 15,309 字。
+    /// * `0.9` —— 欢呼段垃圾字幕 0 条，但断句明显变碎：
+    ///   498 条 final（+45%）/ 14,477 字（−5.4%）。
+    ///
+    /// 值越高越能压掉环境噪声与噪声幻觉，代价是可能把主讲人的话也判成噪声、
+    /// 并把断句切得更碎。0.3 / 0.6 尚无实测数据。
+    /// 取值区间见 [`SPEECH_NOISE_THRESHOLD_MIN`] / [`SPEECH_NOISE_THRESHOLD_MAX`]。
     #[serde(default = "default_speech_noise_threshold")]
     pub speech_noise_threshold: f32,
     #[serde(default = "default_semantic_punctuation")]
@@ -99,6 +112,31 @@ pub struct LlmConfig {
 
 fn default_speech_noise_threshold() -> f32 { 0.0 }
 fn default_semantic_punctuation() -> bool { true }
+
+/// 官方允许的 `speech_noise_threshold` 区间（闭区间）。
+/// 越接近 [`SPEECH_NOISE_THRESHOLD_MIN`] 越容易把噪声当语音转写；
+/// 越接近 [`SPEECH_NOISE_THRESHOLD_MAX`] 越容易把语音判成噪声。
+pub const SPEECH_NOISE_THRESHOLD_MIN: f32 = -1.0;
+pub const SPEECH_NOISE_THRESHOLD_MAX: f32 = 1.0;
+
+/// 把 `speech_noise_threshold` 钳制到官方区间，并挡掉 NaN / ±inf。
+///
+/// 管理页的 `<input type=number min=-1 max=1>` 只是界面提示，手改
+/// `config.toml` 或直接 POST `/api/config` 都能绕过它；超区间的值到不了
+/// 云端（会被服务端拒绝或静默忽略），所以这里在服务端也钳一次。
+pub fn clamp_speech_noise_threshold(value: f32) -> f32 {
+    if value.is_nan() {
+        return default_speech_noise_threshold();
+    }
+    value.clamp(SPEECH_NOISE_THRESHOLD_MIN, SPEECH_NOISE_THRESHOLD_MAX)
+}
+
+/// 同 [`clamp_speech_noise_threshold`]，但按"是否真的被钳过"返回标记，
+/// 供 `/api/status` 告诉管理页当前生效值是不是用户填的那个。
+pub fn clamp_speech_noise_threshold_flagged(value: f32) -> (f32, bool) {
+    let clamped = clamp_speech_noise_threshold(value);
+    (clamped, clamped != value)
+}
 
 fn default_ingest_port() -> u16 {
     8788
@@ -139,6 +177,24 @@ pub fn clamp_clear_after_ms(value: Option<u64>) -> u64 {
     value
         .unwrap_or_else(default_clear_after_ms)
         .clamp(CLEAR_AFTER_MIN_MS, CLEAR_AFTER_MAX_MS)
+}
+
+/// Bounds for the overlay's new-page display buffer. `0` is the special
+/// "no buffer" value (the first page appears the instant it arrives); any other
+/// value lives inside [`DISPLAY_DELAY_MIN_MS`, `DISPLAY_DELAY_MAX_MS`].
+pub const DISPLAY_DELAY_MIN_MS: u64 = 500;
+pub const DISPLAY_DELAY_MAX_MS: u64 = 1_000;
+
+/// Clamp a configured display delay the same way `overlay/app.js` does, so the
+/// value the panel shows, the value the WebSocket pushes and the value the
+/// browser enforces are all identical. `0` (no buffering) is legal; anything
+/// else is clamped into 500–1000 ms; `None` (missing field) keeps the default.
+pub fn clamp_display_delay_ms(value: Option<u64>) -> u64 {
+    match value {
+        None => default_display_delay_ms(),
+        Some(0) => 0,
+        Some(other) => other.clamp(DISPLAY_DELAY_MIN_MS, DISPLAY_DELAY_MAX_MS),
+    }
 }
 
 fn default_audio_test_quiet_ms() -> u64 {
@@ -274,6 +330,9 @@ pub struct OverlayConfig {
     pub max_lines: u32,
     /// Small display buffer for a new caption page. It gives cumulative ASR
     /// revisions time to settle without adding delay to an already-visible page.
+    /// `0` disables the buffer entirely (the first page is shown the moment the
+    /// event arrives); any other value is clamped to 500–1000 ms by both the
+    /// server (`clamp_display_delay_ms`) and the overlay.
     #[serde(default = "default_display_delay_ms")]
     pub display_delay_ms: u64,
     /// Clear the caption after this many milliseconds without a new subtitle
@@ -366,8 +425,11 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_clear_after_ms, AudioTestConfig, Config, AUDIO_TEST_MAX_SEGMENT_MS,
-        AUDIO_TEST_MIN_SEGMENT_MS, CLEAR_AFTER_MAX_MS, CLEAR_AFTER_MIN_MS,
+        clamp_clear_after_ms, clamp_display_delay_ms, clamp_speech_noise_threshold,
+        clamp_speech_noise_threshold_flagged, default_speech_noise_threshold, AudioTestConfig,
+        Config, AUDIO_TEST_MAX_SEGMENT_MS, AUDIO_TEST_MIN_SEGMENT_MS, CLEAR_AFTER_MAX_MS,
+        CLEAR_AFTER_MIN_MS, DISPLAY_DELAY_MAX_MS, DISPLAY_DELAY_MIN_MS,
+        SPEECH_NOISE_THRESHOLD_MAX, SPEECH_NOISE_THRESHOLD_MIN,
     };
     use std::time::Duration;
 
@@ -433,6 +495,84 @@ mod tests {
         assert_eq!(clamp_clear_after_ms(Some(500)), CLEAR_AFTER_MIN_MS);
         assert_eq!(clamp_clear_after_ms(Some(6000)), 6000);
         assert_eq!(clamp_clear_after_ms(Some(999_999)), CLEAR_AFTER_MAX_MS);
+    }
+
+    /// The panel offers "0 秒（无缓冲）", so 0 must survive the server-side clamp
+    /// instead of being pushed up to the 500 ms floor — while every other
+    /// out-of-range value still lands inside the 500–1000 ms window.
+    #[test]
+    fn display_delay_allows_zero_and_clamps_the_rest() {
+        assert_eq!(clamp_display_delay_ms(None), 750);
+        assert_eq!(clamp_display_delay_ms(Some(0)), 0);
+        assert_eq!(clamp_display_delay_ms(Some(500)), 500);
+        assert_eq!(clamp_display_delay_ms(Some(750)), 750);
+        assert_eq!(clamp_display_delay_ms(Some(1000)), 1000);
+        assert_eq!(clamp_display_delay_ms(Some(1)), DISPLAY_DELAY_MIN_MS);
+        assert_eq!(clamp_display_delay_ms(Some(250)), DISPLAY_DELAY_MIN_MS);
+        assert_eq!(clamp_display_delay_ms(Some(999_999)), DISPLAY_DELAY_MAX_MS);
+        // A config saved with 0 must round-trip through TOML as 0, not as the
+        // default: the overlay would otherwise buffer a page the user disabled.
+        let mut cfg = Config::default();
+        cfg.overlay.display_delay_ms = 0;
+        let raw = toml::to_string(&cfg).expect("serialize");
+        let back: Config = toml::from_str(&raw).expect("deserialize");
+        assert_eq!(back.overlay.display_delay_ms, 0);
+        assert_eq!(clamp_display_delay_ms(Some(back.overlay.display_delay_ms)), 0);
+    }
+
+    /// 云端噪声判定阈值：`-1.0`（更多噪声被转写）～ `1.0`（可能把语音误判为
+    /// 噪声）。越界值必须被钳掉，NaN 必须落回默认值，否则会原样写进
+    /// `run-task` 参数被云端拒绝。
+    #[test]
+    fn speech_noise_threshold_is_clamped_and_nan_safe() {
+        assert_eq!(
+            clamp_speech_noise_threshold(SPEECH_NOISE_THRESHOLD_MIN),
+            SPEECH_NOISE_THRESHOLD_MIN
+        );
+        assert_eq!(
+            clamp_speech_noise_threshold(SPEECH_NOISE_THRESHOLD_MAX),
+            SPEECH_NOISE_THRESHOLD_MAX
+        );
+        assert_eq!(clamp_speech_noise_threshold(0.0), 0.0);
+        assert_eq!(clamp_speech_noise_threshold(0.9), 0.9);
+        assert_eq!(
+            clamp_speech_noise_threshold(-9.0),
+            SPEECH_NOISE_THRESHOLD_MIN
+        );
+        assert_eq!(clamp_speech_noise_threshold(9.0), SPEECH_NOISE_THRESHOLD_MAX);
+        assert_eq!(
+            clamp_speech_noise_threshold(f32::NAN),
+            default_speech_noise_threshold()
+        );
+        assert_eq!(
+            clamp_speech_noise_threshold(f32::INFINITY),
+            SPEECH_NOISE_THRESHOLD_MAX
+        );
+        assert_eq!(
+            clamp_speech_noise_threshold(f32::NEG_INFINITY),
+            SPEECH_NOISE_THRESHOLD_MIN
+        );
+        // 标记位告诉管理页"当前生效值不是你填的那个"。
+        assert_eq!(clamp_speech_noise_threshold_flagged(0.3), (0.3, false));
+        assert_eq!(clamp_speech_noise_threshold_flagged(5.0), (1.0, true));
+        assert_eq!(
+            clamp_speech_noise_threshold_flagged(f32::NAN),
+            (0.0, true)
+        );
+    }
+
+    /// 保存 → 读回必须原样，不能被钳成默认值：0.0 是合法值（"关/忠实"档），
+    /// 若被当成"缺省"处理，用户就没法选回忠实模式。
+    #[test]
+    fn speech_noise_threshold_round_trips_through_toml() {
+        for value in [-1.0_f32, 0.0, 0.3, 0.6, 0.9, 1.0] {
+            let mut cfg = Config::default();
+            cfg.llm.speech_noise_threshold = value;
+            let raw = toml::to_string(&cfg).expect("serialize");
+            let back: Config = toml::from_str(&raw).expect("deserialize");
+            assert_eq!(back.llm.speech_noise_threshold, value);
+            assert_eq!(clamp_speech_noise_threshold(back.llm.speech_noise_threshold), value);
+        }
     }
 
     #[test]

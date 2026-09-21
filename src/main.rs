@@ -94,6 +94,12 @@ pub struct AppState {
     pub hotword_status: Arc<RwLock<crate::hotwords::HotwordStatus>>,
     /// 运行期热词源（R10）：管理页保存 → 这里 → provider 的 continue-task。
     pub hotwords: crate::hotwords::HotwordFeed,
+    /// 上一次保存时 `llm.speech_noise_threshold` 是否被钳制过。
+    ///
+    /// 必须单独记：一旦钳过，磁盘与内存里存的就是边界值本身，"值是否越界"
+    /// 再也看不出来。管理页要如实告诉用户"你填的值超出 −1~1，实际按边界值
+    /// 下发"，只能靠这个运行期标记。用户下次保存一个合法值时会清掉。
+    pub speech_noise_threshold_clamped: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -219,6 +225,7 @@ async fn main() -> Result<()> {
         provider_failures: std::sync::atomic::AtomicU32::new(0),
         hotword_status: Arc::new(RwLock::new(crate::hotwords::HotwordStatus::default())),
         hotwords,
+        speech_noise_threshold_clamped: std::sync::atomic::AtomicBool::new(false),
     });
 
     recording::spawn(state.recording.clone(), state.clone());

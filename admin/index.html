@@ -156,19 +156,34 @@
       <button id="audio-test-btn" class="btn ghost" type="button">开始 13 秒试音</button>
       <p class="hint" id="audio-test-hint">点击后先保持 3 秒安静，再正常讲话并包含轻声约 10 秒；结果只用于提示，不会保存或上传音频。</p>
       <label>
-        <span>人声过滤预设</span>
+        <span>过滤预设</span>
         <select id="filter-preset">
-          <option value="soft">保留轻声</option>
-          <option value="balanced" selected>平衡</option>
-          <option value="strong">强过滤</option>
-          <option value="custom">自定义（使用下方静音阈值）</option>
+          <option value="soft">0.0 关（保留轻声）</option>
+          <option value="balanced" selected>0.3 中等（平衡）</option>
+          <option value="straight">0.6 较强</option>
+          <option value="strong">0.9 强（强过滤）</option>
+          <option value="custom">自定义（使用下方两个数值）</option>
         </select>
-        <small class="field-status">预设是起点；请用实际无线麦克风试音后再确认。</small>
+        <small class="field-status">一次设置两个值：云端噪声判定阈值 + 本地静音阈值。预设只是起点，请按自己的音源再微调。</small>
       </label>
+      <div class="preset-row" id="noise-preset-row">
+        <span class="preset-row-label">快捷档位</span>
+        <div class="preset-buttons" id="noise-preset-buttons"></div>
+      </div>
       <label>
-        <span>静音阈值 silence_rms</span>
+        <span>云端噪声判定阈值 speech_noise_threshold</span>
+        <input id="speech-noise-threshold" type="number" min="-1" max="1" step="0.1" value="0" />
+        <small class="field-status">
+          范围 −1 ~ 1（越低越容易把环境噪声当语音转写，越高越容易把主讲人的话判成噪声、断句也会更碎）。
+          只对百炼 <code>bailian-fun-asr</code> 生效；该参数在云端 <code>run-task</code> 时下发，<b>保存配置后会重启识别会话</b>。
+        </small>
+      </label>
+      <p class="hint" id="noise-threshold-status">当前生效值：读取中…</p>
+      <p class="hint" id="noise-provider-hint" hidden>当前通道不是百炼 Fun-ASR：该阈值不会下发到云端（仍会保存，切回百炼后生效）。</p>
+      <label id="silence-rms-row" class="advanced-row" style="display:none">
+        <span>本地静音阈值 silence_rms（高级）</span>
         <input id="silence-rms" type="number" min="0" max="1" step="0.001" value="0.012" />
-        <small class="field-status">低于该 RMS 的帧判为静音。请对照上方实时 RMS 读数设置：安静时略高于背景、明显低于轻声。</small>
+        <small class="field-status">低于该 RMS 的帧判为静音。请对照上方实时 RMS 读数设置：安静时略高于背景、明显低于轻声。仅「自定义」档可改。</small>
       </label>
       <label class="row">
         <input id="use_sck" type="checkbox" />
@@ -216,10 +231,12 @@
       <label>
         <span>新字幕页显示缓冲</span>
         <select id="ov-display-delay">
+          <option value="0">0 秒（无缓冲）</option>
           <option value="500">0.5 秒</option>
           <option value="750" selected>0.75 秒</option>
           <option value="1000">1 秒</option>
         </select>
+        <small class="field-status">新字幕页出现前的缓冲时长；选「0 秒（无缓冲）」时首个页面到达即显示，不做任何延时。</small>
       </label>
       <label>
         <span>无新内容后清屏</span>
