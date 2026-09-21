@@ -48,15 +48,7 @@ impl RecordingStore {
     pub fn start(config_path: &Path, recording_dir: &str) -> Self {
         let started_at_ms = now_ms();
         let session_id = format!("{}-{}", started_at_ms, uuid::Uuid::new_v4());
-        let base = config_path.parent().unwrap_or_else(|| Path::new("."));
-        let requested = PathBuf::from(recording_dir.trim());
-        let dir = if recording_dir.trim().is_empty() {
-            base.join("recordings")
-        } else if requested.is_absolute() {
-            requested
-        } else {
-            base.join(requested)
-        };
+        let dir = recordings_dir(config_path, recording_dir);
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("{session_id}.jsonl"));
         let file = OpenOptions::new().create(true).append(true).open(&path).ok();
@@ -112,6 +104,18 @@ impl RecordingStore {
     }
 }
 
+fn recordings_dir(config_path: &Path, recording_dir: &str) -> PathBuf {
+    let base = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let requested = PathBuf::from(recording_dir.trim());
+    if recording_dir.trim().is_empty() {
+        base.join("recordings")
+    } else if requested.is_absolute() {
+        requested
+    } else {
+        base.join(requested)
+    }
+}
+
 pub fn now_ms() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64 }
 fn srt_time(ms: i64) -> String { format!("{:02}:{:02}:{:02},{:03}", ms / 3_600_000, (ms / 60_000) % 60, (ms / 1_000) % 60, ms % 1_000) }
 
@@ -153,5 +157,12 @@ mod tests {
         let store = RecordingStore::start(Path::new("target/test-config.toml"), "");
         store.append(Record::Final { session_id: store.session_id.clone(), id: "1".into(), text: "你好".into(), language: "zh".into(), started_at_ms: store.started_at_ms, ended_at_ms: store.started_at_ms + 500 });
         assert!(store.srt().contains("00:00:00,000 --> 00:00:01,000"));
+    }
+
+    #[test]
+    fn recording_directory_is_relative_to_config_when_not_absolute() {
+        let config = Path::new("C:/app/config.toml");
+        assert_eq!(recordings_dir(config, ""), PathBuf::from("C:/app/recordings"));
+        assert_eq!(recordings_dir(config, "captures/live"), PathBuf::from("C:/app/captures/live"));
     }
 }
