@@ -55,6 +55,13 @@ pub fn register(tx: PcmSender) -> Registration {
     Registration { _private: () }
 }
 
+/// End the current finite input. This is used when a replay sender closes its
+/// TCP stream: dropping the last raw sender lets the VAD and provider writer
+/// finish normally instead of leaving a live websocket waiting forever.
+fn close_input() {
+    *SENDER.lock() = None;
+}
+
 fn try_send_frame(frame: Vec<i16>) {
     if let Some(tx) = SENDER.lock().as_ref() {
         // Best-effort send; drop on backpressure (same policy as cpal path).
@@ -152,6 +159,7 @@ async fn handle_conn(state: Arc<AppState>, mut stream: TcpStream) -> Result<()> 
     info!(rate = in_rate, "OBS filter audio stream connected");
 
     let result = pump_audio(&state, &mut stream, in_rate).await;
+    close_input();
     {
         let mut s = state.status.write();
         s.audio_active = false;
