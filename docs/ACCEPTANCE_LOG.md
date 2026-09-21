@@ -217,3 +217,71 @@ SHA-256：`3251A0DBC5864D0FE5C00CE4D90C8F9A8A8BEBCEEC4BA97D2B182C293805302B`
   「当前生效值」与 1 秒轮询的配合只有无头 DOM 断言，没有浏览器证据。
 - 非百炼通道「该阈值不会下发」的提示只是界面文案，未逐通道实测。
 - 界面不标注实测状态，用户看不到「哪些值有实测数据」——这是用户明确要求的结果。
+
+## 2026-09-21 22:3x 重建：前端 / 配置三项任务与控件审计
+
+> **重建说明（必读）**：本文件中原有一节记录「前端 / 配置三项任务（0 秒无缓冲、长句翻页闪烁、
+> 管理页控件审计）」及其 59 项控件审计表。该节在工作树中**未提交**，被一次误用的
+> `git checkout -- docs/ACCEPTANCE_LOG.md` 覆盖；`git fsck --lost-found` 无对应不可达对象
+> （该内容从未 `git add`），`%TEMP%`、`evidence/`、全工作区均无副本——**确认不可恢复**。
+> 本节按现存可复核的事实**重建**，**不是原文**，行号与措辞可能与原节不同。
+> 事故本身与根因已记入工作区 `docs/14-交付与验收状态-2026-09-21.md` 第五节。
+
+### 任务一：显示缓冲支持「0 秒（无缓冲）」
+
+| 环节 | 改动 |
+|---|---|
+| `admin/index.html` | 下拉新增 `<option value="0">0 秒（无缓冲）</option>` |
+| `admin/app.js` | 新增 `clampDisplayDelay` / `setSelectValue`，修掉 `||750` 与 `Math.max(500, …)` 把 0 改回 500/750 的写法 |
+| `overlay/app.js` | `clampDisplayDelayMs` 允许 0 或 500–1000；**0 时不创建任何显示定时器**，首段立即显示；typewriter 首单位同步写出 |
+| `src/config.rs` | `clamp_display_delay_ms` + 单元测试 |
+| `src/server.rs` | `GET /api/config` 与 WS `config` 推送共用同一钳制函数 |
+
+### 任务二：长句翻页「第一页与第二页交替闪烁」
+
+- 复现装置：`tests/repro-page-flicker.mjs`，用内存探针记录**每帧实际交给 `displayShown` 的页面**
+  （直接读渲染后的 `pageStart` 会掩盖缺陷）。
+- **修复前**：S1 纯增长 0 次 / S2 尾字重解码 10 次 / S3 句中补词 1 次 / S4 打字机 10 次
+  → `RESULT: FAIL — 21 backward page move(s)`，页面序列 `62 → 0 → 62` 交替。
+- **修复后**：`RESULT: OK — a paging sentence never renders an earlier page again.`，四场景均单调 `0 → 62`。
+- **根因**：`sameOpenSentence()` 旧的前缀兼容判定把真实二次解码误判为新句，从而把翻页光标重置为 0；
+  改为 `findLastPageStart()` **重定位**光标（而非推回第一页），并修掉 `pageStart == full.length` 的空白帧。
+
+### 任务三：管理页控件审计
+
+- 前端调用的 **12 个 `/api/*` 路径全部有对应后端路由**（逐条比对 `admin/app.js` 与 `src/server.rs` 路由表）；
+  `admin/index.html` 共 95 个 `id`（含容器与状态行，非全部为交互控件）。
+- **本轮修复的 3 个不可用项**：
+
+  | 控件 | 原问题 | 修复 |
+  |---|---|---|
+  | `#ov-display-delay` | 无法设为 0 | 见任务一 |
+  | 后台预览分页 | 渲染整句尾巴、永不见第一页 | 预览改为与 `pickShown` 同语义 |
+  | 「清空历史」 | 只清本地导入行，服务端历史无接口 | 新增 `POST /api/subtitles/history/clear`（`src/server.rs` + `src/subtitle.rs::clear_history`） |
+
+- **历史遗留四项复核确认均已修**：清除 Key 未校验 `ok`、预览忽略 `replace` 标记、
+  音量表无轮询、性能模式开关无写入点。
+- **留待决策（未修）**：`support-btn` 无后端占位；`GET /api/config` 明文返回 `obs.password`
+  （API Key 已脱敏，OBS WebSocket 密码未脱敏；服务默认只监听 `127.0.0.1`）；
+  未知 provider 名保存后会被改写为 `openai-realtime`；`/api/locale` 已无调用者。
+
+### 本轮测试（重建时的实测数字）
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test --offline` | **57 passed / 0 failed** |
+| `node tests/run-overlay-tests.mjs` | **25 passed / 0 failed**（基线 21，+4） |
+| `node tests/admin-preset-cases.mjs` | **15 / 15**（新增套件） |
+| `node tests/run-negative-control.mjs` | **PASSED**（7 个扰动全被捕获） |
+| `node --check` × 13 | 全过 |
+| `dist/` 与源目录 6 对 SHA-256 | 全部 identical |
+
+负控制曾有一处**假通过**已修：原 `page-boundary-regression` 扰动只会抛 `anchor not found`
+使 21 例全挂，等于该扰动没有真正验证断言。修正锚点后 7 个扰动均被真实捕获。
+
+### 重建版未验证
+
+- 无真实浏览器 / OBS dock 证据：0 秒缓冲的观感、预览分页、快捷按钮高亮、生效值行与 1 秒轮询的配合
+  均只在无头 DOM 与 shim 层验证。
+- 长句翻页由测试夹具（尾字重解码、句中插词）驱动，不是真实百炼音频流。
+- 上述 3 项修复**未在 OBS 内实测**（新包已安装并观察到位图级加载，但未逐项点按验证）。
