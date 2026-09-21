@@ -833,19 +833,24 @@
       try {
         await apiPost("/api/config", patch);
         await loadConfig();
+        // /api/config intentionally redacts api_key in every GET response.
+        // A literal comparison here therefore turns every successful new-Key
+        // save into a false failure. Validate non-secret fields and, when a
+        // Key was supplied, the separate server-provided presence flag.
         const saved = currentConfig
-          && currentConfig.llm.api_key === patch.llm.api_key
+          && currentConfig.llm.provider === patch.llm.provider
           && currentConfig.llm.model === patch.llm.model;
-        if (saved) {
-          status.textContent = "✓ 已保存";
+        const keySaved = !key || !!(currentConfig && currentConfig.llm && currentConfig.llm.api_key_set);
+        if (saved && keySaved) {
+          status.textContent = key ? "✓ Key 已保存，不会回显" : "✓ 已保存";
           status.className = "status ok";
-          toast("✅ 配置已保存并生效（管线已重启）", "ok");
+          toast(key ? "✅ Key 已保存，不会回显；配置已生效" : "✅ 配置已保存并生效", "ok");
         } else {
           status.textContent = "⚠ 已保存但校验失败";
           status.className = "status err";
           toast("⚠️ 已保存，但读回内容不一致", "error");
         }
-        await apiPost("/api/restart");
+        // POST /api/config already restarts the pipeline after write-verify.
         setTimeout(loadStatus, 800);
       } catch (e) {
         status.textContent = "✗ " + (e.message || e);
