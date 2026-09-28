@@ -13,7 +13,7 @@ name = "stream-live-translate"
 # Bump it in one place, then run scripts/sync-version.ps1 -Fix (Windows) or
 # follow docs/BUILD.md ("Version single source of truth").
 # ---------------------------------------------------------------------------
-version = "0.0.28"
+version = "0.0.29"
 edition = "2021"
 rust-version = "1.74"
 authors = ["Stream Live Translate Contributors"]

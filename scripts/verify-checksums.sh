@@ -37,6 +37,16 @@ fi
 verified=0
 unverified=0
 
+if command -v sha256sum >/dev/null 2>&1; then
+    SHA256_CHECK=(sha256sum -c -)
+elif command -v shasum >/dev/null 2>&1; then
+    # macOS ships shasum rather than GNU coreutils' sha256sum.
+    SHA256_CHECK=(shasum -a 256 -c -)
+else
+    echo "::error::neither sha256sum nor shasum is available" >&2
+    exit 1
+fi
+
 while IFS= read -r sumfile; do
     [ -n "$sumfile" ] || continue
     echo "== verifying $sumfile"
@@ -48,7 +58,7 @@ while IFS= read -r sumfile; do
     # trailing carriage return when checked under Git Bash/Linux.
     (
         cd "$(dirname "$sumfile")"
-        sed 's/\r$//' "$(basename "$sumfile")" | sha256sum -c -
+        sed 's/\r$//' "$(basename "$sumfile")" | "${SHA256_CHECK[@]}"
     )
     verified=$((verified + 1))
 done < <(find "$DIR" -type f -name '*.sha256' | sort)
