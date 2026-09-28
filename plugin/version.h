@@ -5,7 +5,7 @@
  * ---------------
  * The single authoritative product version of this repository is the
  * `version` field of the root `Cargo.toml` (`[package] version`, currently
- * "0.0.27"). Both the Rust engine (`env!("CARGO_PKG_VERSION")`) and this
+ * "0.0.28"). Both the Rust engine (`env!("CARGO_PKG_VERSION")`) and this
  * plugin release are versioned by that one value.
  *
  * WHAT REGENERATES THIS FILE
@@ -37,6 +37,6 @@
 
 /* Kept as a bare literal (no macros, no string concatenation) so CMake can
  * extract it textually without running the C preprocessor. */
-#define SLT_VERSION "0.0.27"
+#define SLT_VERSION "0.0.28"
 
 #endif /* SLT_VERSION_H */

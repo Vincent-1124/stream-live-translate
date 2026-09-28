@@ -244,7 +244,8 @@ _Static_assert(sizeof(g_nonce) == SLT_NONCE_BYTES + 1u,
  *      plugin needs no new import library / dependency (kernel32 is already
  *      linked); falls back to SystemFunction036 in advapi32.dll, which is
  *      also already loaded by OBS.
- *      POSIX: getentropy(), then /dev/urandom (both are in libc; no new
+ *      macOS: arc4random_buf().
+ *      Other POSIX: getentropy(), then /dev/urandom (all are in libc; no new
  *      dependency).
  * There is deliberately no predictable fallback: without a CSPRNG the plugin
  * fails closed instead of starting an ingest session with forgeable identity.
@@ -273,9 +274,14 @@ static bool slt_random_bytes(uint8_t *out, size_t len)
 			return true;
 	}
 	return false;
+#elif defined(__APPLE__)
+	/* arc4random_buf() is provided by libSystem on every supported macOS
+	 * version and cannot fail, so no fallback is necessary here. */
+	arc4random_buf(out, len);
+	return true;
 #else
-	/* getentropy() is glibc >= 2.25 / macOS >= 10.12. Declaring it weak
-	 * means an older libc still links and simply falls through to
+	/* getentropy() is available in glibc >= 2.25. Declaring it weak means
+	 * an older libc still links and simply falls through to
 	 * /dev/urandom instead of failing to load the plugin. */
 #if defined(__GLIBC__)
 	extern int getentropy(void *buffer, size_t length) __attribute__((weak));

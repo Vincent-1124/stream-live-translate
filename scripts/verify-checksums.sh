@@ -43,7 +43,13 @@ while IFS= read -r sumfile; do
     # sha256sum -c resolves the recorded path relative to the CWD, so run it
     # from the sidecar's own directory (the packaging scripts record a bare
     # basename there).
-    ( cd "$(dirname "$sumfile")" && sha256sum -c "$(basename "$sumfile")" )
+    # PowerShell writes CRLF sidecars on Windows. Normalize only the line
+    # ending before verification so the recorded filename never carries a
+    # trailing carriage return when checked under Git Bash/Linux.
+    (
+        cd "$(dirname "$sumfile")"
+        sed 's/\r$//' "$(basename "$sumfile")" | sha256sum -c -
+    )
     verified=$((verified + 1))
 done < <(find "$DIR" -type f -name '*.sha256' | sort)
 
