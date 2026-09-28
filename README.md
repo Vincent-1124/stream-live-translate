@@ -2,6 +2,9 @@
 
 > 实时 AI 字幕 / 同声传译 OBS 插件 —— 从 OBS 媒体源内部取音频 + 大模型流式翻译 + 浏览器源字幕叠加。
 
+> [!NOTE]
+> 本项目基于 [buxicim2026/stream-live-translate](https://github.com/buxicim2026/stream-live-translate) 进行二次开发。感谢原项目作者与贡献者的工作。本仓库在其代码基础上增加功能、修复问题与完善文档。
+
 **Windows 解压后双击安装；Linux/macOS 把插件复制进 OBS 插件目录即可。** OBS 启动时插件自动拉起内置引擎，给任意源挂上“实时字幕捕获”滤镜，填上你自己的大模型 API Key，中文字幕就出现在直播画面上了。详细安装/使用/编译说明见 [docs/PLUGIN.md](docs/PLUGIN.md)。
 
 ## v0.0.26 变更
@@ -219,4 +222,4 @@ stream-live-translate/
 
 ## 许可
 
-MIT
+本项目以 MIT License 发布，详见 [LICENSE](LICENSE)。上游项目在其 README 中同样声明采用 MIT License，来源与二次开发说明见 [NOTICE](NOTICE)。
