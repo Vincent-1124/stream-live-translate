@@ -387,6 +387,10 @@ code {
   justify-content: center;
 }
 .preview-stage { width: 100%; height: 100%; padding: 0 16px 16px; display: flex; align-items: flex-end; justify-content: center; }
+.preview-stage[hidden] { display: none; }
+.preview-obs-viewport { position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); overflow: hidden; pointer-events: none; }
+.preview-obs-viewport[hidden] { display: none; }
+.preview-obs-viewport iframe { display: block; width: 1920px; height: 540px; border: 0; transform-origin: top left; }
 .preview-stage.position-top { align-items: flex-start; padding-top: 16px; }
 .preview-stage.position-middle { align-items: center; }
 .preview-caption {

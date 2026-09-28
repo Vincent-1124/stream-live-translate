@@ -276,7 +276,7 @@ export async function testDeltaStream({ run }) {
 
     const violations = [];
     let advanced = 0;
-    let pageIndex = 0; // start offset of the page currently on screen
+    let pageIndex = 0; // start offset of the current sliding window
     let maxPageIndex = 0;
     let firstAdvanceAt = null;
     let peakLines = 0;
@@ -292,19 +292,20 @@ export async function testDeltaStream({ run }) {
       if (lines > 2) {
         violations.push({ len, lines, domLen: shown.length, height: ov.measuredHeight(shown) });
       }
+      if (ov.lineCount(prefix) > 2) {
+        assert.eq(lines, 2, `a long sentence must keep both configured rows filled (prefix ${len})`);
+      }
 
-      const end = pageSliceStart(prefix, shown, pageIndex);
-      if (end === null) {
+      const start = prefix.indexOf(shown);
+      if (start < pageIndex || !shown.endsWith(prefix[len - 1])) {
         throw new Error(
-          `page shown at prefix ${len} is not a contiguous slice of the accumulated text\n` +
-            `  expected: prefix.slice(${pageIndex}, ${pageIndex} + n) for some n\n` +
+          `window at prefix ${len} must advance and include the latest character\n` +
             `  prefix:   …${JSON.stringify(prefix.slice(Math.max(0, pageIndex - 20)))}\n` +
             `  actual:   ${JSON.stringify(shown.slice(0, 40))}`
         );
       }
-      assert.lte(end, prefix.length, `the page cannot hold more text than received (prefix ${len})`);
-      if (end < prefix.length) {
-        pageIndex = end; // the overlay cut a new page at this offset
+      if (start > pageIndex) {
+        pageIndex = start;
         advanced++;
         maxPageIndex = Math.max(maxPageIndex, pageIndex);
         if (firstAdvanceAt === null) firstAdvanceAt = len;
@@ -333,6 +334,65 @@ export async function testDeltaStream({ run }) {
       `        · ${full.length} prefixes / ${ov.lineCount(full)} lines unpaged; first advance at prefix ` +
         `${firstAdvanceAt}; furthest page started at ${maxPageIndex} (${advanced} cuts)`
     );
+  });
+}
+
+export async function testTwoRowWordWindow({ run }) {
+  await run("A1w long spoken sentence retains two rows and starts at a word", "two-row-word-window", async (load) => {
+    const ov = await load({ overlayConfig: { animation: "fade", max_lines: 2, display_delay_ms: 0 } });
+    const full = LONG_CJK + "包括提交方式等等。分数占比20%，然后所有的课程结束之后会发布这个大作业";
+    const wordStarts = new Set(
+      [...new Intl.Segmenter("zh", { granularity: "word" }).segment(full)]
+        .filter((part) => part.isWordLike).map((part) => part.index)
+    );
+    let checked = 0;
+    for (let len = 1; len <= full.length; len++) {
+      ov.emitPartial(full.slice(0, len), true);
+      if (ov.lineCount(full.slice(0, len)) <= 2) continue;
+      const shown = ov.text;
+      const start = full.slice(0, len).indexOf(shown);
+      assert.eq(ov.lineCount(shown), 2, `prefix ${len} should use two rows after overflow`);
+      assert.ok(shown.endsWith(full[len - 1]), `prefix ${len} should contain the newest character`);
+      assert.ok(wordStarts.has(start), `prefix ${len} starts inside a word at offset ${start}: ${JSON.stringify(shown)}`);
+      checked++;
+    }
+    assert.gt(checked, 20, "the fixture must exercise many overflowing frames");
+  });
+
+  await run("A1wt the live typewriter keeps two visible rows while the window moves", "two-row-typewriter", async (load) => {
+    const ov = await load({ overlayConfig: { animation: "typewriter", max_lines: 2, display_delay_ms: 0 } });
+    const full = LONG_CJK;
+    for (let len = 1; len <= full.length; len++) {
+      ov.emitPartial(full.slice(0, len), true);
+      if (ov.lineCount(full.slice(0, len)) > 2) {
+        assert.eq(ov.lineCount(ov.text), 2, `typewriter frame ${len} must not restart at one character`);
+      }
+      ov.tick(32);
+    }
+    ov.emitPartial(full + "误", true);
+    ov.tick(32);
+    ov.emitPartial(full + "正", true);
+    assert.eq(ov.lineCount(ov.text), 2, "a tail re-decode must keep the visible two-line context");
+  });
+}
+
+export async function testAtomicTypewriterRevisions({ run }) {
+  await run("A1wr corrections and new sentences never flash back to one character", "atomic-typewriter-revision", async (load) => {
+    const ov = await load({ overlayConfig: { animation: "typewriter", display_delay_ms: 0 } });
+    const before = "今天我们讨论字幕修订，旧的识别内容会发生变化。";
+    const corrected = "现在我们讨论字幕修订，新的识别内容会发生变化。";
+    const next = "接下来是一句全新的字幕内容，不应闪回到一个字。";
+    ov.emitPartial(before, true);
+    assert.eq(ov.text, before, "the first complete chunk should appear atomically");
+    ov.emitPartial(corrected, true);
+    assert.eq(ov.text, corrected, "a correction near the start should replace the visible text atomically");
+    ov.emitFinal(corrected);
+    ov.emitPartial(next, true);
+    assert.eq(ov.text, next, "a new sentence should replace the old sentence atomically");
+    ov.emitPartial(next + "好", true);
+    assert.eq(ov.text, next, "a simple append may still use the typewriter animation");
+    ov.tick(32);
+    assert.eq(ov.text, next + "好", "the appended character should appear on the next typewriter tick");
   });
 }
 
@@ -753,15 +813,16 @@ export async function testGeometryMatrix({ run }) {
         if (lines > 2) {
           violations.push({ len, lines, domLen: ov.text.length, height: ov.measuredHeight(ov.text) });
         }
-        const end = pageSliceStart(full.slice(0, len), ov.text, pageIndex);
-        if (end === null) {
+        const prefix = full.slice(0, len);
+        const start = prefix.indexOf(ov.text);
+        if (start < pageIndex || !ov.text.endsWith(prefix[len - 1])) {
           throw new Error(
-            `width ${width}: page at prefix ${len} is not a contiguous slice of the text\n` +
+            `width ${width}: window at prefix ${len} must advance and include the latest character\n` +
               `  actual: ${JSON.stringify(ov.text.slice(0, 40))}`
           );
         }
-        if (end < len) {
-          pageIndex = end;
+        if (start > pageIndex) {
+          pageIndex = start;
           maxPageIndex = Math.max(maxPageIndex, pageIndex);
         }
       }
@@ -775,9 +836,9 @@ export async function testGeometryMatrix({ run }) {
     });
   }
 
-  await run("A1c max_lines:6 from the server cannot buy a third line", "max-lines-6", async (load) => {
+  await run("A1c max_lines:6 is clamped to four lines", "max-lines-6", async (load) => {
     const ov = await load({ overlayConfig: { max_lines: 6 } });
-    const full = LONG_CJK;
+    const full = LONG_CJK.repeat(2);
     ov.emitPartial(full.slice(0, 1));
     ov.tick(DISPLAY_DELAY_MS);
     const violations = [];
@@ -786,22 +847,65 @@ export async function testGeometryMatrix({ run }) {
     for (let len = 2; len <= full.length; len++) {
       ov.emitPartial(full[len - 1]);
       const lines = ov.lineCount(ov.text);
-      if (lines > 2) {
+      if (lines > 4) {
         violations.push({ len, lines, domLen: ov.text.length, height: ov.measuredHeight(ov.text) });
       }
-      const end = pageSliceStart(full.slice(0, len), ov.text, pageIndex);
-      if (end !== null && end < len) {
-        pageIndex = end;
+      const start = full.slice(0, len).indexOf(ov.text);
+      if (start > pageIndex) {
+        pageIndex = start;
         maxPageIndex = Math.max(maxPageIndex, pageIndex);
       }
     }
-    assert.eq(violations.length, 0, `max_lines:6 must stay capped at 2: ${describeViolations(violations)}`);
-    assert.gt(maxPageIndex, 0, "max_lines:6 must still page, not grow the box");
+    assert.eq(violations.length, 0, `max_lines:6 must stay capped at 4: ${describeViolations(violations)}`);
+    assert.gt(maxPageIndex, 0, "max_lines:6 must still page after the fourth line");
     assert.eq(
       ov.document.documentElement.style.getPropertyValue("--caption-max-height"),
-      `${2 * ov.lineHeightPx}.00px`,
-      "the two-line viewport height must be enforced regardless of config"
+      `${4 * ov.lineHeightPx}.00px`,
+      "the four-line viewport height must be enforced regardless of config"
     );
+  });
+
+  for (const rows of [3, 4]) {
+    await run(`A1c max_lines:${rows} displays a real ${rows}-line page`, `max-lines-${rows}`, async (load) => {
+      const ov = await load({ overlayConfig: { max_lines: rows } });
+      ov.emitPartial("字".repeat(rows === 3 ? 85 : 95));
+      ov.tick(DISPLAY_DELAY_MS);
+      assert.eq(ov.lineCount(ov.text), rows, `configured ${rows} lines must be usable`);
+      assert.eq(
+        ov.document.documentElement.style.getPropertyValue("--caption-max-height"),
+        `${rows * ov.lineHeightPx}.00px`,
+        `configured ${rows}-line height must reach the overlay`
+      );
+    });
+  }
+
+  await run("A1c a punctuation boundary does not waste the second line", "punctuation-page", async (load) => {
+    const ov = await load();
+    const first = "今".repeat(30) + "，";
+    const second = "天".repeat(40);
+    ov.emitPartial(first + second, true);
+    ov.tick(DISPLAY_DELAY_MS);
+    assert.eq(ov.lineCount(ov.text), 2, "a first-line comma must not waste the second line");
+    assert.ok(ov.text.includes("，"), "the sliding window should retain the comma while it fits");
+    assert.ok(ov.text.includes("天"), "the window must continue beyond the first-line comma");
+    ov.emitPartial(first + second + "。", true);
+    ov.tick(DISPLAY_DELAY_MS);
+    assert.ok(ov.text.length > 0, "the next page must remain visible");
+  });
+
+  await run("A1c a shortened revision rebases the page cursor", "cursor-rebase", async (load) => {
+    const ov = await load();
+    const full = "甲".repeat(62) + "乙".repeat(62) + "丙".repeat(32);
+    ov.emitPartial(full, true);
+    ov.tick(DISPLAY_DELAY_MS);
+    ov.emitPartial(full + "丁", true);
+    ov.tick(DISPLAY_DELAY_MS);
+    ov.emitPartial(full.slice(0, 100), true);
+    ov.tick(DISPLAY_DELAY_MS);
+    assert.ok(ov.text.includes("乙"), "a shortened revision must keep its newest page visible");
+    ov.emitPartial(full.slice(0, 40), true);
+    ov.tick(DISPLAY_DELAY_MS);
+    assert.eq(ov.text, full.slice(0, 40), "a revision shorter than the old cursor must not render blank");
   });
 
   await run("A1s max_lines:1 keeps strict single-line mode", "max-lines-1", async (load) => {
@@ -1251,6 +1355,8 @@ export async function testLocalReplayPath({ run }) {
 export const TEST_PLAN = [
   { id: "shim", title: "DOM shim self-checks (measurement model)", fn: testShimFidelity },
   { id: "delta", title: "two-line cap + paging (delta partial stream)", fn: testDeltaStream },
+  { id: "word-window", title: "two-row word-aligned live window", fn: testTwoRowWordWindow },
+  { id: "atomic-revision", title: "atomic typewriter corrections and new sentences", fn: testAtomicTypewriterRevisions },
   { id: "replace", title: "two-line cap + paging (cumulative replace stream)", fn: testReplaceStream },
   { id: "replay", title: "overlay's own replay fixtures", fn: testReplayFixtures },
   { id: "shifting", title: "shifting cumulative revision (page stays inside the revision)", fn: testShiftingRevision },

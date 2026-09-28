@@ -19,7 +19,12 @@ param(
     [string]$ObsVersion = "30.2.3",
     [string]$ObsInstallDir = "",
     [string]$WorkDir = "build\plugin-sdk",
-    [switch]$SkipEngine
+    [switch]$SkipEngine,
+    # Rewrite the ?v= cache-busting strings in admin/index.html and
+    # overlay/index.html to the canonical Cargo.toml version. Off by default
+    # so a packaging run never silently edits files owned by other agents;
+    # without it the run fails loudly with the exact drift instead.
+    [switch]$FixAssetVersions
 )
 
 $ErrorActionPreference = "Stop"
@@ -75,6 +80,22 @@ function Invoke-Native {
 $version = (Select-String -Path "$root\Cargo.toml" -Pattern '^version = "([^"]+)"' |
     Select-Object -First 1).Matches[0].Groups[1].Value
 Step "Packaging Stream Live Translate OBS plugin v$version (Windows x64)"
+
+# --- 0a. Version consistency ------------------------------------------------
+# Cargo.toml is the single source of truth. plugin/version.h must match it
+# (plugin/CMakeLists.txt aborts otherwise) and the ?v= cache-busting strings
+# must not advertise a different release. Fail here, before anything is built,
+# rather than shipping a package whose asset URLs claim another version.
+$syncArgs = @{}
+if ($FixAssetVersions) { $syncArgs["Fix"] = $true }
+Step "Checking version consistency (canonical: Cargo.toml v$version)"
+$versionSync = Join-Path $PSScriptRoot "sync-version.ps1"
+& $versionSync @syncArgs
+if ($LASTEXITCODE -ne 0) {
+    throw ("Version consistency check failed. Cargo.toml says $version. " +
+        "Re-run with -FixAssetVersions to rewrite the admin/overlay ?v= strings, " +
+        "or apply the edits listed in docs/BUILD.md by hand.")
+}
 
 # --- 0. Sanity: MSVC toolchain on PATH ------------------------------------
 foreach ($exe in "lib", "dumpbin", "cl") {
@@ -169,7 +190,24 @@ New-Item -ItemType Directory -Force -Path "$pkgRoot\data\engine" | Out-Null
 Copy-Item $dll.FullName "$pkgRoot\bin\64bit\"
 Copy-Item "$root\plugin\locale\*.ini" "$pkgRoot\data\locale\"
 Copy-Item $engineExe "$pkgRoot\data\engine\"
-Copy-Item "$root\README.md" "$pkgRoot\README.md"
+$installerScript = "$root\scripts\install-plugin.ps1"
+$installerBytes = [System.IO.File]::ReadAllBytes($installerScript)
+if ($installerBytes.Length -lt 3 -or
+    $installerBytes[0] -ne 0xEF -or
+    $installerBytes[1] -ne 0xBB -or
+    $installerBytes[2] -ne 0xBF) {
+    throw "install-plugin.ps1 must be UTF-8 with BOM so Windows PowerShell 5.1 can parse its Chinese UI text"
+}
+Copy-Item $installerScript "$pkgRoot\install-plugin.ps1"
+$installerCmd = "$root\scripts\install-plugin.cmd"
+$installerCmdText = [System.IO.File]::ReadAllText($installerCmd, [System.Text.Encoding]::UTF8)
+if ($installerCmdText -match '(?<!\r)\n') {
+    throw "install-plugin.cmd must use Windows CRLF line endings so cmd.exe does not split commands incorrectly"
+}
+Copy-Item $installerCmd "$pkgRoot\双击安装.cmd"
+$userGuides = @(Get-ChildItem "$root\docs" -Filter "*-Windows.md" -File)
+if ($userGuides.Count -ne 1) { throw "expected one Windows user guide, found $($userGuides.Count)" }
+Copy-Item $userGuides[0].FullName "$pkgRoot\README.md"
 
 New-Item -ItemType Directory -Force -Path "$root\release" | Out-Null
 $outZip = "$root\release\stream-live-translate-obs-win-x64-$version.zip"
@@ -206,5 +244,5 @@ Set-Content -Path "$outZip.sha256" -Value "$hash  $(Split-Path -Leaf $outZip)"
 
 Step "Done: $outZip"
 Write-Host "    SHA256: $hash"
-Write-Host "    Install: extract so that the 'stream-live-translate' folder lands in"
-Write-Host "    %APPDATA%\obs-studio\plugins\  (or <OBS install dir>\plugins\)"
+Write-Host "    Install: extract the package, close OBS, then double-click"
+Write-Host "    stream-live-translate\双击安装.cmd"

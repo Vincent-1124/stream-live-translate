@@ -102,7 +102,10 @@ pub fn plan(words: &[String]) -> HotwordPlan {
     }
     for word in &plan.words {
         if let Some(message) = word_warning(word) {
-            plan.warnings.push(HotwordWarning { word: word.clone(), message });
+            plan.warnings.push(HotwordWarning {
+                word: word.clone(),
+                message,
+            });
         }
     }
 
@@ -149,10 +152,7 @@ pub fn plan(words: &[String]) -> HotwordPlan {
                 current_len = 0;
                 plan.warnings.push(HotwordWarning {
                     word: word.clone(),
-                    message: format!(
-                        "单条热词超过 {} 字符，已截断后才下发",
-                        ROUND_TEXT_MAX_CHARS
-                    ),
+                    message: format!("单条热词超过 {} 字符，已截断后才下发", ROUND_TEXT_MAX_CHARS),
                 });
             } else {
                 current = word.clone();
@@ -295,7 +295,9 @@ mod tests {
 
     #[test]
     fn ascii_words_with_more_than_seven_segments_are_flagged() {
-        let p = plan(&v(&["The effect of temperature variations on enzyme activity"]));
+        let p = plan(&v(&[
+            "The effect of temperature variations on enzyme activity",
+        ]));
         assert_eq!(
             p.warnings.iter().filter(|w| !w.word.is_empty()).count(),
             1,

@@ -3,7 +3,7 @@
 Repeatable Node regression tests for the live-subtitle overlay
 (`overlay/app.js` + `overlay/index.html` + `overlay/style.css`).
 
-They lock down the **two-line cap**, the **paging advance**, the **display
+They lock down the **configurable 1–4 line cap** (default: two lines), the **word-aligned live window**, the **display
 buffer semantics**, the **clear-after-silence timer** and the **`replace:true`
 revision semantics** so a future edit cannot silently break them.
 
@@ -72,11 +72,16 @@ tests. A copy could not detect a regression in the real code.
 
 | id | assertion |
 | --- | --- |
-| `delta-stream` | **every** prefix of a 155-char CJK sentence, streamed as true deltas: DOM `scrollHeight <= 120px` (<= 2 lines), the page is a contiguous slice of the text received, the page advances, and the last rendered page reaches the tail. |
+| `delta-stream` | **every** prefix of a 155-char CJK sentence, streamed as true deltas: DOM `scrollHeight <= 120px` (<= 2 lines); after overflow, the latest window still occupies two lines and ends with the newest character. |
+| `two-row-word-window` | a long spoken sentence including “分数占比20%” retains two rows after overflow and starts at an `Intl.Segmenter` word boundary. |
+| `two-row-typewriter` | the default typewriter keeps two *visible* rows immediately after each live window shift and after an ASR tail revision, without waiting for its next timer tick. |
+| `atomic-typewriter-revision` | corrections and new sentences replace the visible caption atomically (no one-character flash); only a true append waits for the next typewriter tick. |
 | `replace-stream` | same sweep with cumulative `replace:true` revisions: <= 2 lines, pages are contiguous slices, `pageStart` never moves backwards, paging advances (max page start > 0) and the **union of all rendered ranges covers 155/155 characters** (nothing skipped). |
 | `replay-REPLAY_PAGED` / `replay-REPLAY_VERY_LONG` | the overlay's own replay samples (`overlay/app.js`), prefix by prefix, <= 2 lines. |
 | `geometry-1600` / `geometry-800` | the same sweep at browser-source widths 1600 px and 800 px (800 px = 15 CJK chars/line, more cuts). |
-| `max-lines-6` | a server config asking for `max_lines: 6` still yields a 2-line viewport and paging, never a third line. |
+| `max-lines-3` / `max-lines-4` | configured three- and four-line pages really render at those heights. |
+| `max-lines-6` | a server config asking for `max_lines: 6` is capped at four lines and still pages. |
+| `punctuation-page` | a comma on the first line does not force an early page turn when the configured second line is available. |
 | `max-lines-1` | `max_lines: 1` keeps strict single-line mode (`single-line` class, one-line viewport). |
 | `typewriter` | with `animation: typewriter`, every page handed to `displayShown()` is still <= 2 lines, the page is a contiguous slice of the streamed sentence, the page advances (furthest page start > 0) and it never moves backwards. The page is read from an in-memory render log, because `textContent` is only a typed *prefix* of the page while the animation runs. |
 
@@ -128,7 +133,7 @@ every perturbation is caught by at least one case that passes in the baseline.
 
 | perturbation | what it breaks | caught by |
 | --- | --- | --- |
-| `two-line-cap` | `if (lines > 2) lines = 2;` -> `lines = 4;` | 14 cases (incl. `local-replay`) |
+| `two-line-cap` | `if (lines > 4) lines = 4;` -> `lines = 6;` | the configured line-cap case |
 | `buffer-semantics` | `show()` re-arms the display timer on every buffered partial | `buffer`, `local-replay` |
 | `replace-semantics` | `replacePartial()` appends the revision instead of replacing the buffer | `replace-stream`, `shifting-revision`, `page-flicker`, `page-flicker-typewriter`, `clear-live`, `clear-config`, `replace-semantics`, `typewriter` |
 | `page-boundary-regression` | `pickShown()` renders from `pageStart` to the end again (the historical off-by-one) | 12 cases, incl. `page-flicker`, `local-replay` |

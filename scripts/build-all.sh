@@ -7,6 +7,17 @@
 # scripts/package-plugin.sh instead (see docs/PLUGIN.md).
 set -euo pipefail
 cd "$(dirname "$0")/.."
+ROOT="$(pwd)"
+
+# Cargo.toml is the authoritative version; fail before building if a derived
+# version (plugin/version.h, ?v= cache-busters) disagrees with it.
+if [ -f "$ROOT/scripts/sync-version.sh" ]; then
+    if [ "${FIX_VERSION_ASSETS:-0}" = "1" ]; then
+        bash "$ROOT/scripts/sync-version.sh" --fix
+    else
+        bash "$ROOT/scripts/sync-version.sh"
+    fi
+fi
 
 PLATFORM="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"

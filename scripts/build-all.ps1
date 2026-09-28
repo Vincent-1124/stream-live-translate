@@ -8,12 +8,28 @@
 # use scripts/package-plugin.ps1 instead (see docs/PLUGIN.md).
 [CmdletBinding()]
 param(
-    [string]$Target = ""
+    [string]$Target = "",
+    # Rewrite the ?v= cache-busting strings in admin/overlay to the canonical
+    # Cargo.toml version before building (embedded assets are built from a
+    # copy of admin/ and overlay/, so this must run first).
+    [switch]$FixAssetVersions
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Push-Location $root
+
+# Cargo.toml is the authoritative version; fail before building if a derived
+# version (plugin/version.h, ?v= cache-busters) disagrees with it.
+$versionSync = Join-Path $PSScriptRoot "sync-version.ps1"
+if (Test-Path -LiteralPath $versionSync) {
+    $syncArgs = @{}
+    if ($FixAssetVersions) { $syncArgs["Fix"] = $true }
+    & $versionSync @syncArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Version consistency check failed; see the [DRIFT] lines above."
+    }
+}
 
 if ($IsWindows -or $env:OS -match "Windows") {
     $defaultTarget = "x86_64-pc-windows-msvc"

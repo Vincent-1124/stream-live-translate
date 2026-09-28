@@ -1,12 +1,25 @@
 [package]
 name = "stream-live-translate"
-version = "0.0.25"
+# ---------------------------------------------------------------------------
+# SINGLE SOURCE OF TRUTH for the product version.
+#
+# Everything else derives from this line:
+#   * Rust        -> env!("CARGO_PKG_VERSION")
+#   * plugin/     -> plugin/version.h (checked against this value by
+#                    plugin/CMakeLists.txt, which aborts on mismatch)
+#   * scripts/    -> package-plugin.ps1 / .sh and sync-version.* read it
+#   * assets      -> the ?v= cache-busting query strings in admin/index.html
+#                    and overlay/index.html (see docs/BUILD.md)
+# Bump it in one place, then run scripts/sync-version.ps1 -Fix (Windows) or
+# follow docs/BUILD.md ("Version single source of truth").
+# ---------------------------------------------------------------------------
+version = "0.0.26"
 edition = "2021"
 rust-version = "1.74"
 authors = ["Stream Live Translate Contributors"]
 description = "Real-time AI subtitle overlay for OBS Studio. Capture system audio, stream it to a realtime translation model, and render Chinese subtitles in a Browser Source."
 license = "MIT"
-repository = "https://github.com/yourname/stream-live-translate"
+repository = "https://github.com/Vincent-1124/stream-live-translate"
 readme = "README.md"
 keywords = ["obs", "subtitles", "live", "translation", "ai"]
 categories = ["multimedia", "network"]
@@ -29,9 +42,6 @@ debug = 0
 # MSVC builds must not depend on VCRUNTIME140.dll: the engine is spawned by
 # the OBS plugin and the OBS install dir is NOT in its DLL search path, so a
 # missing VC++ redistributable would make it exit silently on startup.
-
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
 
 [profile.release-windows]
 inherits = "release"

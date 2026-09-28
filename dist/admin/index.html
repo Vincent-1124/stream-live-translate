@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <title>Stream Live Translate · 控制台</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <link rel="stylesheet" href="/admin-assets/style.css?v=0.1.0" />
+  <link rel="stylesheet" href="/admin-assets/style.css?v=0.0.26" />
 </head>
 <body>
   <header class="topbar">
@@ -208,7 +208,9 @@
       </label>
       <label>
         <span>OBS 密码（如果开启了）</span>
-        <input id="obs-password" type="password" />
+        <input id="obs-password" type="password" placeholder="留空保留已保存的密码" />
+        <small id="obs-password-status" class="field-status">未设置</small>
+        <button id="clear-obs-password-btn" class="btn ghost" type="button">清除已保存 OBS 密码</button>
       </label>
       <p class="hint">
         想把控制台钉到 OBS 侧边栏？OBS → 顶部菜单 <b>工具</b> →
@@ -225,8 +227,8 @@
         <input id="ov-size" type="number" value="48" />
       </label>
       <label>
-        <span>最大行数（直播最多两行）</span>
-        <input id="ov-max-lines" type="number" value="2" min="1" max="2" />
+          <span>字幕最大行数（1–4 行）</span>
+          <input id="ov-max-lines" type="number" value="2" min="1" max="4" />
       </label>
       <label>
         <span>新字幕页显示缓冲</span>
@@ -302,11 +304,15 @@
 
     <section class="card wide">
       <h2>6. 实时字幕预览</h2>
+      <p class="hint">这里直接显示 OBS 字幕页面；修改样式后保存配置即可看到实际效果。</p>
       <div class="preview">
         <div id="preview-stage" class="preview-stage position-bottom">
           <div id="preview-caption" class="preview-caption empty">
             <span id="preview-line"></span>
           </div>
+        </div>
+        <div id="preview-obs-viewport" class="preview-obs-viewport" hidden>
+          <iframe id="preview-obs-frame" title="OBS 实际字幕画面" referrerpolicy="no-referrer"></iframe>
         </div>
       </div>
       <div class="actions">
@@ -335,8 +341,8 @@
           <span>📂 导入字幕文件</span>
           <input id="import-file" type="file" accept=".srt,.vtt,.txt,.json,text/plain" hidden />
         </label>
-        <a class="btn ghost" href="/api/recordings/export?format=txt" download="live-subtitles.txt">导出本场 TXT</a>
-        <a class="btn ghost" href="/api/recordings/export?format=srt" download="live-subtitles.srt">导出本场 SRT</a>
+        <a id="export-txt" class="btn ghost" href="/api/recordings/export?format=txt" download="live-subtitles.txt">导出本场 TXT</a>
+        <a id="export-srt" class="btn ghost" href="/api/recordings/export?format=srt" download="live-subtitles.srt">导出本场 SRT</a>
         <button id="clear-history-btn" class="btn ghost" type="button">清空历史</button>
         <span class="hint" id="import-hint">支持 SRT / VTT / TXT / JSON（把字幕加到下方历史区，不写入服务器）</span>
       </div>
@@ -376,6 +382,11 @@
     <button id="support-btn" class="btn ghost footer-support" type="button">支持本项目</button>
   </footer>
 
-  <script src="/admin-assets/app.js?v=0.1.0"></script>
+  <!-- The server replaces __SLT_TOKEN__ with the caller's own access token
+       (empty for an anonymous request). The token arrives as a script global,
+       never as a URL parameter, so it cannot leak through browser history,
+       Referer headers or access logs. -->
+  <script>window.__SLT_TOKEN__ = "__SLT_TOKEN__";</script>
+  <script src="/admin-assets/app.js?v=0.0.26"></script>
 </body>
 </html>

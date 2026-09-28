@@ -349,11 +349,38 @@
     sel.value = best !== null ? best : String(fallback);
   }
 
+  /// Coerce ONE value from /api/config into a number, keeping a legal `0`.
+  /// Only a missing / empty / non-numeric value falls back to `dflt`:
+  /// `value || dflt` and `Number(value) || dflt` turn a legal zero into the
+  /// default, which is the P2-04 defect (`overlay.bg_opacity = 0`,
+  /// `overlay.border_radius = 0`, `overlay.bg_width = 0`,
+  /// `filter.silence_rms = 0` all came back as their defaults and were then
+  /// written back to config.toml on the next save).
+  function cfgNum(value, dflt) {
+    if (value === null || value === undefined || value === "") return dflt;
+    const n = Number(value);
+    return isFinite(n) ? n : dflt;
+  }
+
+  /// Read a numeric control the same way as [`cfgNum`]: `dflt` means "the field
+  /// holds no value at all" (missing element / empty / garbage), never `0`.
+  ///
+  /// `Number` rather than `parseInt`: `filter.silence_rms` is fractional
+  /// (0.012), and `parseInt` silently truncated it to `0` in the live RMS
+  /// readout and in its 高于/低于阈值 hint.
   function num(id, dflt) {
     const el = $(id);
     if (!el) return dflt;
-    const n = parseInt(el.value, 10);
-    return isFinite(n) ? n : dflt;
+    return cfgNum(el.value, dflt);
+  }
+
+  /// Write a configured number into a numeric control, keeping a legal `0`.
+  /// Returns the value that was written.
+  function loadNum(id, value, dflt) {
+    const n = cfgNum(value, dflt);
+    const el = $(id);
+    if (el) el.value = String(n);
+    return n;
   }
 
   // ---- Form 填充 / 收集 -------------------------------------------------
@@ -387,8 +414,13 @@
     $("transcribe").checked = !!cfg.llm.transcribe;
     $("transcription_model").value = cfg.llm.transcription_model || "";
     $("gateway_text").checked = !!cfg.llm.gateway_text;
+    // `segment_ms = 0` is the legal "低延迟模式关闭" value and is carried by the
+    // checkbox on the line above, so 0 is not a value of this select; only a
+    // hand-edited value the markup does not offer (e.g. 1000) needs a fallback,
+    // and `setSelectValue` picks the closest option for it (the old
+    // `String(cfg.llm.segment_ms || 1200)` always snapped it to 1200).
     $("low_latency").checked = !!cfg.llm.segment_ms;
-    $("segment_ms").value = String(cfg.llm.segment_ms || 1200);
+    setSelectValue($("segment_ms"), cfgNum(cfg.llm.segment_ms, 1200) || 1200, 1200);
 
     // Audio
     const modeSel = $("audio-mode");
@@ -400,8 +432,14 @@
     }
     modeSel.value = cfg.audio.mode;
     $("use_sck").checked = !!cfg.audio.use_screen_capture_kit;
-    const rms = Number(cfg.filter && cfg.filter.silence_rms);
-    const rmsValue = isFinite(rms) && rms > 0 ? rms : 0.012;
+    // 本地静音阈值：`silence_rms = 0` 是**合法且有确定语义**的值。
+    // `src/vad.rs::Vad::decide()` 只在 `rms < silence_rms` 时判为静音，而 RMS
+    // 永远 >= 0，所以 0 = 关掉静音门限（每一帧都继续走音乐/语音判定）；
+    // `src/config.rs::Config::clamp()` 把它规整到 [0, 1]，0 能原样通过服务端。
+    // 旧的 `isFinite(rms) && rms > 0 ? rms : 0.012` 会把 0 换成 0.012，保存后
+    // 静音门限就在用户不知情的情况下被重新打开了。
+    const rmsValue = Math.min(1, Math.max(0,
+      cfgNum(cfg.filter ? cfg.filter.silence_rms : undefined, 0.012)));
     $("silence-rms").value = String(rmsValue);
     // 云端阈值：`_clamped` 由服务端给出（手改 config.toml 写越界值时），
     // 这时显示的必须是服务端真正会下发的值，并把"被钳过"告诉用户。
@@ -424,27 +462,36 @@
     $("obs-host").value = cfg.obs.host || "127.0.0.1";
     $("obs-port").value = cfg.obs.port || 4455;
     $("obs-password").value = cfg.obs.password || "";
+    $("obs-password-status").textContent = cfg.obs.password_set ? "✓ 已设置（不会回显）" : "未设置";
     $("recording-dir").value = cfg.recording_dir || "";
 
     // Overlay
-    $("ov-size").value = cfg.overlay.font_size || 48;
-    $("ov-max-lines").value = cfg.overlay.max_lines || 2;
+    // 每个数值控件都走 loadNum()：`|| 48` / `|| 8` 之类会把**合法的 0**
+    // （圆角 0、背景宽度/高度 0 = 自动、bg_opacity 0 = 全透明）当成"没有值"
+    // 换成默认值，下一次保存就把默认值写回服务端，用户的配置被悄悄改掉。
+    loadNum("ov-size", cfg.overlay.font_size, 48);
+    loadNum("ov-max-lines", cfg.overlay.max_lines, 2);
     // 0 = 「无缓冲」 is a legal value: `|| 750` would silently turn it back into
     // a 750 ms buffer, and an unlisted value used to leave the select blank.
     setSelectValue($("ov-display-delay"), cfg.overlay.display_delay_ms ?? 750, 750);
     setSelectValue($("ov-clear-after"), cfg.overlay.clear_after_ms ?? 4000, 4000);
-    $("ov-bg-width").value = cfg.overlay.bg_width || 0;
-    $("ov-bg-height").value = cfg.overlay.bg_height || 0;
-    $("ov-border-radius").value = cfg.overlay.border_radius || 8;
-    const op = cfg.overlay.bg_opacity !== undefined ? cfg.overlay.bg_opacity : 75;
-    $("ov-bg-opacity").value = op;
+    loadNum("ov-bg-width", cfg.overlay.bg_width, 0);
+    loadNum("ov-bg-height", cfg.overlay.bg_height, 0);
+    loadNum("ov-border-radius", cfg.overlay.border_radius, 8);
+    const op = loadNum("ov-bg-opacity", cfg.overlay.bg_opacity, 75);
     $("ov-opacity-display").textContent = op + "%";
     $("ov-color").value = cfg.overlay.font_color || "#ffffff";
     $("ov-bg").value = cfg.overlay.background_color || "#000000";
-    $("ov-position").value = cfg.overlay.position || "bottom";
-    $("ov-animation").value = cfg.overlay.animation || "typewriter";
+    // 服务端存的是 `bottom` / `top` / `middle`（`typewriter` / `fade` / `slide`）。
+    // 直接赋值时，一个 markup 里没有的值会让 select 变成**空白**，而空白会被
+    // 当成 "" 保存回去（既不是位置也不是动画）；`setSelectValue` 取精确匹配，
+    // 否则取默认值，和 display_delay_ms 一样。
+    setSelectValue($("ov-position"), cfg.overlay.position, "bottom");
+    setSelectValue($("ov-animation"), cfg.overlay.animation, "typewriter");
 
-    $("obs-dock-url").textContent = `${location.protocol}//${location.host}/admin?obsDock=1`;
+    // 停靠窗口地址带管理令牌（服务端也会通过 /api/status 回传同一份）；
+    // 这里给出首帧可用值，避免状态轮询到达前显示一个用不了的地址。
+    applyDockUrl(null);
 
     // 热词（R10）：来自配置的多行文本 + 服务端给出的分发/生效状态。
     const hw = $("hotwords");
@@ -463,6 +510,15 @@
   function collectPatch() {
     const providerType = $("provider-type").value;
     const provider = PROVIDER_TYPE_MAP[providerType];
+    // 过滤预设同时管两个值，但它们属于**不同**的配置段，必须分别落到该落的
+    // 地方：云端阈值是 `llm.speech_noise_threshold`（随 run-task 下发，
+    // src/llm.rs 读的就是它），本地静音门限是 `filter.silence_rms`
+    // （src/vad.rs 读它）。
+    //
+    // 旧实现把两者一起塞进 `filter`，于是 `filter.speech_noise_threshold` 被
+    // serde 当成未知键丢掉 —— 选「强过滤」实际上**没有改到云端阈值**，
+    // 面板却显示已生效。这里只取一次，避免两个分支算出不同的值。
+    const preset = filterPresetPatch();
     return {
       llm: {
         provider: provider,
@@ -477,13 +533,14 @@
         transcription_model: $("transcription_model").value.trim(),
         gateway_text: $("gateway_text").checked,
         hotwords: parseHotwords($("hotwords") ? $("hotwords").value : ""),
+        speech_noise_threshold: preset.speech_noise_threshold,
       },
       audio: {
         mode: $("audio-mode").value,
         device: $("audio-device").value,
         use_screen_capture_kit: $("use_sck").checked,
       },
-      filter: filterPresetPatch(),
+      filter: { silence_rms: preset.silence_rms },
       obs: {
         auto_connect: $("obs-auto").checked,
         host: $("obs-host").value,
@@ -492,14 +549,18 @@
       },
       recording_dir: $("recording-dir").value.trim(),
       overlay: {
-        font_size: parseInt($("ov-size").value, 10) || 48,
-        max_lines: Math.min(2, Math.max(1, parseInt($("ov-max-lines").value, 10) || 2)),
+        // `num()` preserves a legal 0; the old `parseInt(...) || d` idioms wrote
+        // the default back over it (bg_opacity 0 → 75 was the worst one).
+        font_size: num("ov-size", 48),
+        max_lines: Math.min(4, Math.max(1, num("ov-max-lines", 2))),
         display_delay_ms: clampDisplayDelay($("ov-display-delay").value),
-        clear_after_ms: Math.min(15000, Math.max(1000, parseInt($("ov-clear-after").value, 10) || 4000)),
-        bg_width: Math.max(0, parseInt($("ov-bg-width").value, 10) || 0),
-        bg_height: Math.max(0, parseInt($("ov-bg-height").value, 10) || 0),
-        border_radius: Math.max(0, parseInt($("ov-border-radius").value, 10) || 0),
-        bg_opacity: parseInt($("ov-bg-opacity").value, 10) || 75,
+        clear_after_ms: Math.min(15000, Math.max(1000, num("ov-clear-after", 4000))),
+        bg_width: Math.max(0, num("ov-bg-width", 0)),
+        bg_height: Math.max(0, num("ov-bg-height", 0)),
+        border_radius: Math.max(0, num("ov-border-radius", 8)),
+        // 0 = fully transparent is legal (`src/config.rs` documents it and only
+        // clamps the value down to <= 100), so this must not be `|| 75`.
+        bg_opacity: Math.min(100, Math.max(0, num("ov-bg-opacity", 75))),
         font_color: $("ov-color").value,
         background_color: $("ov-bg").value,
         position: $("ov-position").value,
@@ -602,11 +663,15 @@
     const threshold = clampThreshold($("speech-noise-threshold").value);
     $("speech-noise-threshold").value = String(threshold);
     // 「自定义」读输入框：手改的值原样保存，不回落到预设。
-    const rmsTyped = Number($("silence-rms").value);
-    const silenceRms = preset === "custom"
-      ? (isFinite(rmsTyped) && rmsTyped >= 0 ? rmsTyped : 0.012)
-      : PRESET_VALUES[preset].silenceRms;
-    if (preset !== "custom") $("silence-rms").value = String(silenceRms);
+    //
+    // `0` 是合法值（关掉本地静音门限，见 fillForm 里的说明），必须有别于"
+    // 输入框是空的"：`Number("")` 也是 0，旧写法会把"清空输入框"当成"用户
+    // 要 0"保存下去，把静音门限关掉。空/非法才回落到 0.012。
+    const presetValues = PRESET_VALUES[preset];
+    const silenceRms = preset !== "custom" && presetValues
+      ? presetValues.silenceRms
+      : Math.min(1, Math.max(0, num("silence-rms", 0.012)));
+    if (presetValues) $("silence-rms").value = String(silenceRms);
     return { speech_noise_threshold: threshold, silence_rms: silenceRms };
   }
 
@@ -672,7 +737,13 @@
     el.hidden = false;
   }
 
-  function updateProviderUI() {
+  /// `opts.prefillEndpoint` is only true for an explicit provider switch: the
+  /// empty string is a legal "use the built-in default" for every provider
+  /// (`src/llm.rs` keeps a default host for each of them), and filling it in
+  /// during fillForm() turned the stored `endpoint = null` into a concrete URL
+  /// that the next unrelated save then persisted.
+  function updateProviderUI(opts) {
+    const prefillEndpoint = !!(opts && opts.prefillEndpoint);
     const providerType = $("provider-type").value;
     const hint = PROVIDER_HINTS[providerType] || PROVIDER_HINTS.mock;
     const hintBox = $("provider-hint-box");
@@ -690,7 +761,7 @@
     });
 
     $("endpoint").placeholder = hint.endpointPlaceholder;
-    if (providerType !== "mock" && !$("endpoint").value) {
+    if (prefillEndpoint && providerType !== "mock" && !$("endpoint").value) {
       $("endpoint").value = hint.endpointDefault || "";
     }
 
@@ -741,6 +812,9 @@
       hexToRgba($("ov-bg").value, op / 100) || `rgba(0,0,0,${op / 100})`;
     el.style.width = w > 0 ? Math.round(w * k) + "px" : "auto";
     el.style.height = h > 0 ? Math.round(h * k) + "px" : "auto";
+    // The OBS caption is capped at 1600px. Keep the scaled preview at the
+    // same width, or it wraps later and appears to show a different page.
+    el.style.maxWidth = `min(96%, ${Math.round(1600 * k)}px)`;
     el.style.borderRadius = Math.round(radius * k) + "px";
     const lineEl = $("preview-line");
     if (lineEl) {
@@ -766,6 +840,46 @@
       else hi = mid - 1;
     }
     return best;
+  }
+  function previewFindLastPageStart(text, maxH) {
+    let lo = 0, hi = text.length, best = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (previewMeasure(text.slice(mid)) <= maxH) { best = mid; hi = mid - 1; }
+      else lo = mid + 1;
+    }
+    return best;
+  }
+
+  const previewWordSegmenter = typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter("zh", { granularity: "word" }) : null;
+  function previewPreferredCut(text, start, limit, minHeight) {
+    let punctuation = 0;
+    for (let i = start; i < limit; i++) {
+      const ch = text[i];
+      if ("，。！？；,.;!?".includes(ch) &&
+          !((ch === "." || ch === ",") && /\d/.test(text[i - 1] || "") && /\d/.test(text[i + 1] || ""))) {
+        punctuation = i + 1;
+        while (punctuation < limit && "”’」』》〉】）)]".includes(text[punctuation])) punctuation++;
+      }
+    }
+    if (punctuation > start && previewMeasure(text.slice(start, punctuation)) > minHeight) return punctuation;
+    let word = 0;
+    if (previewWordSegmenter) {
+      for (const part of previewWordSegmenter.segment(text)) {
+        const end = part.index + part.segment.length;
+        if (end > limit) break;
+        if (end > start) word = end;
+      }
+    } else {
+      for (let i = start + 1; i < limit; i++) {
+        if (/\s/.test(text[i - 1])) word = i;
+      }
+    }
+    if (word > start && previewMeasure(text.slice(start, word)) > minHeight) return word;
+    if (limit > start + 1 && /[\uD800-\uDBFF]/.test(text[limit - 1]) &&
+        /[\uDC00-\uDFFF]/.test(text[limit])) return limit - 1;
+    return limit;
   }
 
   /// 预览分页必须和 overlay/app.js 的 `sameOpenSentence()` 同一套语义：累计修订
@@ -807,8 +921,11 @@
     const lh = parseFloat(getComputedStyle(caption).lineHeight) || 0;
     const maxH = previewLines * lh;
     if (maxH <= 0) { lineEl.textContent = previewText; return; }
-    if (previewPageStart >= previewText.length) previewPageStart = 0;
-    const cut = previewFindCut(previewText, previewPageStart, maxH);
+    if (previewPageStart >= previewText.length) {
+      previewPageStart = previewFindLastPageStart(previewText, maxH);
+    }
+    let cut = previewFindCut(previewText, previewPageStart, maxH);
+    if (cut < previewText.length) cut = previewPreferredCut(previewText, previewPageStart, cut, maxH - lh / 2);
     let shown;
     if (cut >= previewText.length) {
       shown = previewText.slice(previewPageStart);
@@ -819,11 +936,11 @@
     }
     if (lineEl.textContent !== shown) lineEl.textContent = shown;
   }
-  function setPreviewText(text, append) {
+  function setPreviewText(text, preservePage) {
     const next = text || "";
     // A revision of the sentence on screen keeps the page cursor; anything else
     // (a new sentence, a cleared caption) starts at page 1 again.
-    if (!append || !previewSameSentence(previewText, next)) previewPageStart = 0;
+    if (!preservePage || !previewSameSentence(previewText, next)) previewPageStart = 0;
     previewText = next;
     renderPreview();
   }
@@ -988,17 +1105,76 @@
   }
 
   // ---- API 调用 --------------------------------------------------------
+
+  /// 访问令牌（P0-01）。
+  ///
+  /// 服务端给管理接口和字幕 WebSocket 都加了鉴权。令牌由服务端在渲染
+  /// /admin 时注入为 `window.__SLT_TOKEN__`（不是 URL 参数，所以不会进浏览器
+  /// 历史、Referer 或访问日志）；`?token=` 只作为兜底，因为 OBS 面板可能在
+  /// 加载后重写地址。
+  let recoveredAccessToken = "";
+  function accessToken() {
+    if (recoveredAccessToken) return recoveredAccessToken;
+    const injected = typeof window !== "undefined" && typeof window.__SLT_TOKEN__ === "string"
+      ? window.__SLT_TOKEN__
+      : "";
+    if (injected) return injected;
+    try {
+      return new URLSearchParams(location.search).get("token") || "";
+    } catch {
+      return "";
+    }
+  }
+
+  async function recoverLocalAccessToken() {
+    if (recoveredAccessToken) return false;
+    const host = String(location.hostname || "").replace(/^\[|\]$/g, "").toLowerCase();
+    if (!["127.0.0.1", "localhost", "::1"].includes(host)) return false;
+    try {
+      const response = await fetch("/api/auth/local-token", { cache: "no-store" });
+      if (!response.ok) return false;
+      const result = await response.json();
+      if (!/^[a-f0-9]{64}$/i.test(result.token || "")) return false;
+      recoveredAccessToken = result.token;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function ensureAccessToken() {
+    if (!accessToken()) await recoverLocalAccessToken();
+  }
+
+  /// 管理页用的是**管理令牌**（可改配置/停管线/读记录），与 overlay 的只读
+  /// 令牌是两个不同的密钥，互相不能替代。
+  function authHeaders(extra) {
+    const token = accessToken();
+    return token ? Object.assign({ "x-slt-token": token }, extra || {}) : (extra || {});
+  }
+
   async function apiGet(path) {
-    const r = await fetch(path, { cache: "no-store" });
+    let r = await fetch(path, { cache: "no-store", headers: authHeaders() });
+    if ((r.status === 401 || r.status === 403) && await recoverLocalAccessToken()) {
+      r = await fetch(path, { cache: "no-store", headers: authHeaders() });
+    }
+    if (r.status === 401 || r.status === 403) {
+      throw new Error("访问令牌无效或权限不足，请重新打开管理页（令牌由服务端自动注入）");
+    }
     if (!r.ok) throw new Error("GET " + path + " → HTTP " + r.status);
     return r.json();
   }
   async function apiPost(path, body) {
-    const r = await fetch(path, {
+    const options = {
       method: "POST",
-      headers: body ? { "content-type": "application/json" } : {},
+      headers: body ? authHeaders({ "content-type": "application/json" }) : authHeaders(),
       body: body === undefined ? null : JSON.stringify(body),
-    });
+    };
+    let r = await fetch(path, options);
+    if ((r.status === 401 || r.status === 403) && await recoverLocalAccessToken()) {
+      options.headers = body ? authHeaders({ "content-type": "application/json" }) : authHeaders();
+      r = await fetch(path, options);
+    }
     if (!r.ok) {
       let msg = "HTTP " + r.status;
       try { const j = await r.json(); if (j.error) msg = j.error; } catch {}
@@ -1007,12 +1183,29 @@
     return r.json().catch(() => ({}));
   }
 
+  async function downloadRecording(link) {
+    const response = await fetch(link.getAttribute("href"), {
+      cache: "no-store",
+      headers: authHeaders(),
+    });
+    if (!response.ok) throw new Error("导出失败：HTTP " + response.status);
+    const url = URL.createObjectURL(await response.blob());
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = link.download;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  }
+
   async function loadConfig() {
     const cfg = await apiGet("/api/config");
     currentConfig = cfg;
     fillForm(cfg);
-    $("overlay-url-box").hidden = false;
-    $("overlay-url").value = `${location.protocol}//${location.host}/overlay`;
+    // 浏览器源地址由 /api/status 回传（带只读令牌）；这里先显示不带令牌的
+    // 本机地址作为兜底，状态到达后立即替换。
+    applyOverlayUrl(null);
   }
 
   async function loadDevices() {
@@ -1048,6 +1241,59 @@
       $("recording-path").textContent = "本场记录：" + (info.jsonl_path || "不可用");
     } catch (e) {
       $("recording-path").textContent = "本场记录路径不可用：" + (e.message || e);
+    }
+  }
+
+  /// 把服务端给的 URL 补上本页令牌（P0-01）。
+  ///
+  /// 服务端返回的 `overlay_url` 已经带**只读令牌**，这里必须原样使用、不能
+  /// 再拼：overlay 只需要读字幕和样式，把管理令牌塞进浏览器源 URL 会把改配置
+  /// 的权限一起交出去。
+  function withToken(url) {
+    if (!url) return url;
+    if (/[?&]token=/.test(url)) return url;
+    const token = accessToken();
+    if (!token) return url;
+    return url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token);
+  }
+
+  /// OBS 内的管理面板停靠窗口要带**管理**令牌，否则面板自己会被 401 挡住。
+  function applyDockUrl(status) {
+    const el = $("obs-dock-url");
+    if (!el) return;
+    if (status && status.obs_dock_url) {
+      el.textContent = status.obs_dock_url;
+      return;
+    }
+    el.textContent = withToken(`${location.protocol}//${location.host}/admin?obsDock=1`);
+  }
+
+  /// 浏览器源地址用服务端给的只读令牌版本；服务端没给（旧版）才自己拼。
+  function applyOverlayUrl(status) {
+    const box = $("overlay-url-box");
+    const input = $("overlay-url");
+    if (!box || !input) return;
+    box.hidden = false;
+    input.value = (status && status.overlay_url) || `${location.protocol}//${location.host}/overlay`;
+
+    // Use the very same page and viewport as the OBS browser source. A second
+    // subtitle renderer in the panel cannot stay pixel- and frame-identical
+    // when paging, font metrics, or typewriter timing change.
+    const frame = $("preview-obs-frame");
+    const viewport = $("preview-obs-viewport");
+    const stage = $("preview-stage");
+    const preview = viewport && viewport.parentElement;
+    const url = status && status.overlay_url;
+    if (!frame || !viewport || !stage || !preview || !url || !/[?&]token=/.test(url)) return;
+    const width = Number(preview.clientWidth) || 1920;
+    const scale = Math.min(0.45, Math.max(0.1, (width - 24) / 1920));
+    viewport.style.width = Math.round(1920 * scale) + "px";
+    viewport.style.height = Math.round(540 * scale) + "px";
+    frame.style.transform = `scale(${scale})`;
+    if (frame.dataset.overlayUrl !== url) {
+      frame.dataset.overlayUrl = url;
+      frame.onload = () => { stage.hidden = true; viewport.hidden = false; };
+      frame.src = url;
     }
   }
 
@@ -1109,6 +1355,10 @@
         el.classList.add(ok ? "ok" : warn ? "warn" : "bad");
       };
       set("dot-audio", !!s.audio_active, false);
+      // 地址里的令牌由服务端回传（P0-01）：浏览器源用只读令牌，停靠窗口用
+      // 管理令牌。面板自己拼不出来，也不该拼。
+      applyDockUrl(s);
+      applyOverlayUrl(s);
       const level = Math.max(0, Math.min(1, Number(s.input_level) || 0));
       // The bar uses a mild power curve so the everyday 0.005–0.05 range stays
       // visible; the exact RMS number below it is what calibration reads.
@@ -1214,7 +1464,10 @@
   }
   function connectWS() {
     const wsScheme = location.protocol === "https:" ? "wss" : "ws";
-    const url = `${wsScheme}://${location.host}/ws/subtitles`;
+    // 令牌走查询参数：浏览器 WebSocket 构造函数不能自定义请求头。
+    const token = accessToken();
+    const url = `${wsScheme}://${location.host}/ws/subtitles` +
+      (token ? `?token=${encodeURIComponent(token)}` : "");
     setWsState("connecting", "WS 连接中…");
     try {
       ws = new WebSocket(url);
@@ -1250,7 +1503,7 @@
           } else {
             pendingPartial = (pendingPartial || "") + text;
           }
-          setPreviewText(pendingPartial, false);
+          setPreviewText(pendingPartial, true);
           $("preview-caption").classList.remove("empty");
         }
       } else if (p.type === "final") {
@@ -1258,7 +1511,7 @@
         if (text) {
           pendingPartial = text;
           lastFinalText = text;
-          setPreviewText(pendingPartial, false);
+          setPreviewText(pendingPartial, true);
           $("preview-caption").classList.remove("empty");
           loadHistory();
         }
@@ -1283,9 +1536,11 @@
 
   // ---- 事件绑定 --------------------------------------------------------
   function bindEvents() {
-    $("provider-type").addEventListener("change", updateProviderUI);
-    $("low_latency").addEventListener("change", updateProviderUI);
-    $("transcribe").addEventListener("change", updateProviderUI);
+    // 切换服务商时顺手把该服务商的默认端点填进空输入框（只是便利）；加载配置
+    // 时不做这件事，否则合法的空端点会被固化成具体 URL 并在下次保存写回。
+    $("provider-type").addEventListener("change", () => updateProviderUI({ prefillEndpoint: true }));
+    $("low_latency").addEventListener("change", () => updateProviderUI());
+    $("transcribe").addEventListener("change", () => updateProviderUI());
     // 热词编辑时实时校验（含 400 字符分轮与词形规范告警）。
     const hwBox = $("hotwords");
     if (hwBox) {
@@ -1444,6 +1699,25 @@
         btn.textContent = original;
       }
     });
+
+    $("clear-obs-password-btn").addEventListener("click", async () => {
+      try {
+        const result = await apiPost("/api/config/clear-obs-password");
+        if (!result || result.ok !== true) throw new Error((result && result.error) || "服务器未确认清除结果");
+        await loadConfig();
+        toast("已清除保存的 OBS 密码", "ok");
+      } catch (error) {
+        toast("清除 OBS 密码失败：" + (error.message || error), "error");
+      }
+    });
+
+    for (const id of ["export-txt", "export-srt"]) {
+      $(id).addEventListener("click", async (event) => {
+        event.preventDefault();
+        try { await downloadRecording(event.currentTarget); }
+        catch (error) { toast(error.message || String(error), "error"); }
+      });
+    }
 
     $("connection-test-btn").addEventListener("click", async () => {
       const btn = $("connection-test-btn");
@@ -1609,9 +1883,12 @@
     // 「自定义」档：静音阈值可以手改；云端阈值任何档位都可手改。手改后预设
     // 会切到「自定义」，但另一个数值保持不变。
     $("silence-rms").addEventListener("input", () => {
-      const typed = Number($("silence-rms").value);
+      const raw = $("silence-rms").value;
+      const typed = Number(raw);
       const noise = clampThreshold($("speech-noise-threshold").value);
-      if (isFinite(typed)) $("filter-preset").value = presetForValues(noise, typed);
+      // 空输入框不是 0：只有真的填了数值才据此重算预设（0 本身是合法值，会
+      // 判成「自定义」）。
+      if (raw !== "" && isFinite(typed)) $("filter-preset").value = presetForValues(noise, typed);
       syncPresetUI();
       refreshRmsReadout();
       renderThresholdStatus();
@@ -1622,8 +1899,9 @@
     $("speech-noise-threshold").addEventListener("input", () => {
       enforceThresholdRange();
       const noise = clampThreshold($("speech-noise-threshold").value);
-      const rms = Number($("silence-rms").value);
-      if (isFinite(rms)) $("filter-preset").value = presetForValues(noise, rms);
+      const rmsRaw = $("silence-rms").value;
+      const rms = Number(rmsRaw);
+      if (rmsRaw !== "" && isFinite(rms)) $("filter-preset").value = presetForValues(noise, rms);
       syncPresetUI();
       refreshRmsReadout();
       renderThresholdStatus();
@@ -1649,6 +1927,7 @@
       renderPerfModeButton();
       renderThresholdButtons();
       setupFileImport();
+      await ensureAccessToken();
       await loadConfig();
       await loadDevices();
       await loadRecordingInfo();

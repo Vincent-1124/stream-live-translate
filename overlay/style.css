@@ -4,7 +4,7 @@
    via the body class.
 
    背景规则（v0.0.20）：
-   * 字幕恒为「一行」，永不换行 —— 背景高度默认刚好包住这一行。
+   * 字幕行数由管理页设置为 1–4 行，背景高度默认随文字贴合。
    * 背景颜色 + 透明度由 JS 合成 rgba() 写入 --caption-bg（admin 面板
      「背景设置 → 背景 / 背景透明度」）。
    * 宽 / 高 / 圆角由 --caption-width / --caption-height / --caption-radius
@@ -37,7 +37,7 @@ body.position-middle { align-items: center; }
 
 .caption {
   /* inline-flex + align-items:center 让「固定高度」时文字垂直居中；
-     未指定高度时高度 = 一行 line-height + padding，即「一行高」。 */
+     未指定高度时高度随实际字幕行数变化。 */
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -51,7 +51,7 @@ body.position-middle { align-items: center; }
   text-align: center;
   line-height: 1.25;
   letter-spacing: 0.01em;
-  /* 长句时给出稳定的两行行距，避免换行瞬间背景抖动 */
+  /* 长句时给出稳定的多行行距，避免换行瞬间背景抖动 */
   word-break: break-word;
   overflow-wrap: break-word;
   font-weight: 600;
@@ -62,7 +62,7 @@ body.position-middle { align-items: center; }
   transition: opacity 200ms ease, transform 200ms ease;
   position: relative;
   overflow: hidden;
-  /* 0 = 自动（贴合一行文字）；admin 面板里填了具体数值则由 JS 覆盖。 */
+  /* 0 = 自动（贴合文字）；admin 面板里填了具体数值则由 JS 覆盖。 */
   width: var(--caption-width, auto);
   height: var(--caption-height, auto);
 }

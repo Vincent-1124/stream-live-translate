@@ -1,6 +1,12 @@
 # OBS 插件模式指南
 
-从 v0.7.0 起，Stream Live Translate 以**正式 OBS 插件**形式分发：把插件文件夹复制进 OBS 的插件目录即可使用，无需安装器。
+Stream Live Translate 以**正式 OBS 插件**形式分发。Windows 发布包内含一键安装脚本，Linux/macOS 把插件文件夹复制进 OBS 的插件目录即可使用。
+
+> **版本**：插件与引擎共用同一个权威版本号，即 `Cargo.toml` 的 `[package] version`
+> （当前 `0.0.26`）。历史文档里出现的 `v0.7.0` 是版本统一之前的插件包编号，
+> 不再是有效版本；`plugin/version.h` 的 `SLT_VERSION`、CMake `project(... VERSION ...)`
+> 和打包产物文件名都由 `Cargo.toml` 派生，规则见 [docs/BUILD.md](BUILD.md) 的
+> "Version single source of truth"。
 
 ## 架构
 
@@ -35,20 +41,21 @@ OBS 源（媒体源/窗口采集/…）
 字幕广播 → OBS 浏览器源（/overlay）
 ```
 
-## 安装（免安装，复制即用）
+## 安装
 
-从 GitHub Releases 下载对应平台的插件包并解压，把 `stream-live-translate` 文件夹**整个**放到：
+从 GitHub Releases 下载对应平台的插件包并解压。Windows 用户先完全退出 OBS，然后双击
+`stream-live-translate\双击安装.cmd`。它会安装到 OBS 官方推荐的
+`C:\ProgramData\obs-studio\plugins`，并同时提供 OBS 32 与 OBS 33 需要的 DLL 布局。
 
-| 平台 | 插件目录（推荐，无需管理员权限） |
+Linux/macOS 把插件文件夹**整个**放到：
+
+| 平台 | 插件目录 |
 | --- | --- |
-| Windows | `%APPDATA%\obs-studio\plugins\` |
 | Linux | `~/.config/obs-studio/plugins/` |
 | macOS (Apple Silicon) | `~/Library/Application Support/obs-studio/plugins/` |
 
-> **注意**：必须保留解压后的目录结构，即最终路径形如
-> `%APPDATA%\obs-studio\plugins\stream-live-translate\bin\64bit\stream-live-translate.dll`。
-> OBS **不会**扫描安装目录下的 `plugins\` 文件夹；如果要装进 OBS 安装目录，
-> dll 要放 `<OBS安装目录>\obs-plugins\64bit\`，data 目录要放 `<OBS安装目录>\data\obs-plugins\stream-live-translate\`（需要管理员权限，一般不推荐）。放好后重启 OBS。
+> Windows 不要再手工复制到 `%APPDATA%\obs-studio\plugins`；现场验证的 OBS 32.2.2 Steam 版不会从该位置加载本插件。
+> 如果是 OBS 便携模式，需按 OBS 官方的 portable 插件目录规则手工安装。
 
 > macOS 首次使用若被 Gatekeeper 拦截，对解压出来的文件执行一次
 > `xattr -dr com.apple.quarantine stream-live-translate.plugin`。
@@ -102,6 +109,14 @@ u32       格式：0 = 单声道 s16le
 脚本做的事：`cargo build --release` 编译引擎 → 浅克隆 obs-studio 拿 libobs 头文件 → 从已安装 OBS（或自动下载的官方发布包）的 `obs.dll` 用 dumpbin+lib 生成导入库 → CMake 编译插件 → 组装打包。
 **不需要编译 OBS 本身**，符号在运行时由已安装的 OBS 解析。
 
+打包前会先做版本一致性检查（权威版本 = `Cargo.toml`）：`plugin/version.h` 与
+`admin/overlay` 的 `?v=` 缓存串必须与之一致，否则**直接失败**并打印需要改的地方。
+要顺手把 `?v=` 改写成权威版本：
+
+```powershell
+.\scripts\package-plugin.ps1 -FixAssetVersions
+```
+
 ### Linux x64
 
 前置：Rust、gcc/clang、cmake、git、`libasound2-dev`（编译 cpal 用）。
@@ -140,7 +155,7 @@ bash scripts/package-plugin.sh
 
 | 现象 | 排查 |
 | --- | --- |
-| OBS 日志没有 `[SLT]` | 插件文件夹位置不对；确认 `bin/64bit/xxx.dll` 层级正确 |
+| OBS 日志没有 `[SLT]` | Windows 先关闭 OBS 并重跑 `双击安装.cmd`；Linux/macOS 确认插件层级正确 |
 | 滤镜加上了但没字幕 | 检查管理面板状态；确认 `config.toml` 里 `audio.mode = "obs_filter"`（插件拉起引擎时会自动写入） |
 | 引擎没被拉起 | 查看 OBS 日志中 `[SLT] failed to spawn engine`；macOS 注意 quarantine 属性 |
 | 端口冲突 | 改滤镜"引擎接收端口"+`config.toml` 的 `ingest_port` 为同一个空闲端口 |

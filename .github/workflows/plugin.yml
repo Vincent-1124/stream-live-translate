@@ -9,20 +9,46 @@ on:
     tags: ["v*"]
   workflow_dispatch: {}
 
+# Least privilege by default: the build jobs only need to read the repository.
+# The `release` job below is the only one granted `contents: write`.
+#
+# Actions are pinned to verified full commit SHAs; the trailing comment keeps
+# the corresponding human-readable upstream version visible to reviewers.
+permissions:
+  contents: read
+
 env:
   OBS_VERSION: "30.2.3"
   CARGO_TERM_COLOR: always
 
 jobs:
+  validate-version:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Validate Cargo, plugin, asset and tag versions
+        shell: bash
+        run: |
+          args=()
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            args+=(--tag "$GITHUB_REF_NAME")
+          fi
+          bash scripts/sync-version.sh "${args[@]}"
+
   win-x64:
+    needs: validate-version
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-23
+      - uses: ilammy/msvc-dev-cmd@a102174a2b586eec2ea151a69e6fd14404a8ce7c # v1.13.0
+
+      - name: Test Windows installer
+        shell: pwsh
+        run: ./tests/install-plugin-tests.ps1
 
       - name: Cache OBS SDK assets
-        uses: actions/cache@v4
+        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
         with:
           path: |
             build/plugin-sdk/obs-studio
@@ -33,8 +59,20 @@ jobs:
         shell: pwsh
         run: ./scripts/package-plugin.ps1 -ObsVersion $env:OBS_VERSION
 
+      - name: Verify packaged checksums
+        shell: bash
+        # The packaging scripts already emit `<archive>.sha256`; prove it
+        # matches the archive that is about to be uploaded.
+        run: ./scripts/verify-checksums.sh release
+
+      - name: Secret / template guard
+        shell: bash
+        # Same gate as the `release` job, so a tainted package cannot even be
+        # uploaded as an intermediate artifact.
+        run: ./scripts/ci-secret-guard.sh release
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: obs-plugin-win-x64
           path: |
@@ -42,10 +80,11 @@ jobs:
             release/stream-live-translate-obs-win-x64-*.zip.sha256
 
   linux-x64:
+    needs: validate-version
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-23
 
       - name: Install build dependencies
         run: |
@@ -53,7 +92,7 @@ jobs:
           sudo apt-get install -y cmake git pkg-config libasound2-dev libssl-dev
 
       - name: Cache OBS SDK assets
-        uses: actions/cache@v4
+        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
         with:
           path: build/plugin-sdk/obs-studio
           key: obs-sdk-linux-${{ env.OBS_VERSION }}
@@ -63,8 +102,16 @@ jobs:
           chmod +x scripts/package-plugin.sh
           OBS_VERSION=$OBS_VERSION bash scripts/package-plugin.sh
 
+      - name: Verify packaged checksums
+        shell: bash
+        run: ./scripts/verify-checksums.sh release
+
+      - name: Secret / template guard
+        shell: bash
+        run: ./scripts/ci-secret-guard.sh release
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: obs-plugin-linux-x64
           path: |
@@ -72,13 +119,14 @@ jobs:
             release/stream-live-translate-obs-linux-x64-*.tar.gz.sha256
 
   macos-arm64:
+    needs: validate-version
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-23
 
       - name: Cache OBS SDK assets
-        uses: actions/cache@v4
+        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
         with:
           path: build/plugin-sdk/obs-studio
           key: obs-sdk-macos-${{ env.OBS_VERSION }}
@@ -88,8 +136,16 @@ jobs:
           chmod +x scripts/package-plugin.sh
           OBS_VERSION=$OBS_VERSION bash scripts/package-plugin.sh
 
+      - name: Verify packaged checksums
+        shell: bash
+        run: ./scripts/verify-checksums.sh release
+
+      - name: Secret / template guard
+        shell: bash
+        run: ./scripts/ci-secret-guard.sh release
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: obs-plugin-macos-arm64
           path: |
@@ -100,16 +156,72 @@ jobs:
     needs: [win-x64, linux-x64, macos-arm64]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
+    # The only job that writes to the repository.
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
           pattern: obs-plugin-*
           path: artifacts
 
+      - name: Verify downloaded checksums
+        shell: bash
+        # Each uploaded package has a `<name>.sha256` sibling produced by the
+        # packaging script; re-verify after the round trip through Actions
+        # artifact storage, before anything is published.
+        run: ./scripts/verify-checksums.sh artifacts
+
+      - name: Create release manifest (name, size, SHA-256)
+        shell: bash
+        # Records size + SHA-256 for every published file next to the
+        # artifacts, so the `artifacts/**/*` upload glob picks it up too.
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"   # v1.2.3 -> 1.2.3 (matches CARGO_PKG_VERSION)
+
+          if [ -z "$(find artifacts -type f -print -quit)" ]; then
+            echo "::error::no downloaded artifacts to manifest; nothing to release"
+            exit 1
+          fi
+
+          mkdir -p artifacts/tools
+          {
+            printf '{\n'
+            printf '  "tag": "%s",\n' "$GITHUB_REF_NAME"
+            printf '  "version": "%s",\n' "$VERSION"
+            printf '  "commit": "%s",\n' "$GITHUB_SHA"
+            printf '  "generated_by": "plugin.yml",\n'
+            printf '  "files": [\n'
+            first=1
+            for artifact in $(find artifacts -type f | sort); do
+              case "$artifact" in
+                artifacts/tools/*) continue ;;
+              esac
+              size=$(stat -c '%s' "$artifact")
+              hash=$(sha256sum "$artifact" | cut -d' ' -f1)
+              [ "$first" -eq 1 ] || printf ',\n'
+              first=0
+              printf '    { "file": "%s", "bytes": %s, "sha256": "%s" }' "${artifact#artifacts/}" "$size" "$hash"
+            done
+            printf '\n  ]\n'
+            printf '}\n'
+          } > artifacts/tools/release-manifest.json
+
+          ( cd artifacts && find . -type f ! -path './tools/*' -print0 \
+              | sort -z | xargs -0 sha256sum ) > artifacts/tools/SHA256SUMS
+
+          echo "== release manifest"
+          cat artifacts/tools/release-manifest.json
+
+      - name: Secret / template guard
+        shell: bash
+        run: ./scripts/ci-secret-guard.sh artifacts
+
       - name: Publish to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@e7a8f85e1c67a31e6ed99a94b41bd0b71bbee6b8 # v2.0.9
         with:
           files: |
             artifacts/**/*

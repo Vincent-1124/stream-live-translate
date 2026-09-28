@@ -28,3 +28,6 @@ Thumbs.db
 
 # Build/release notes scratch
 /release-draft.md
+
+# Local diagnostics
+/job_logs.zip

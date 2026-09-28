@@ -5,6 +5,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 pub mod audio;
+pub mod auth;
 pub mod config;
 pub mod embedded;
 pub mod hotwords;
@@ -62,6 +63,18 @@ struct Cli {
     /// deliberately not persisted, so a replay run cannot alter an OBS setup.
     #[arg(long, global = true)]
     ingest_port: Option<u16>,
+    /// Admin token for the local HTTP API (P0-01). Env: `SLT_ADMIN_TOKEN`.
+    /// Supply both tokens together to allow a non-loopback `--host`.
+    #[arg(long, global = true, env = "SLT_ADMIN_TOKEN")]
+    admin_token: Option<String>,
+    /// Read-only token handed to the overlay / OBS Browser Source.
+    /// Env: `SLT_OVERLAY_TOKEN`.
+    #[arg(long, global = true, env = "SLT_OVERLAY_TOKEN")]
+    overlay_token: Option<String>,
+    /// One-time nonce the OBS plugin passes so the ingest port can verify it is
+    /// talking to this engine (P0-05). Not persisted.
+    #[arg(long, global = true, env = "SLT_INGEST_NONCE")]
+    ingest_nonce: Option<String>,
 }
 
 pub struct AppState {
@@ -76,8 +89,7 @@ pub struct AppState {
     pub pipeline: Arc<pipeline::PipelineHandle>,
     pub status: Arc<RwLock<AppStatus>>,
     pub recording: recording::RecordingStore,
-    pub obs_cmd_tx:
-        parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<crate::obs::ObsCommand>>>,
+    pub obs_cmd_tx: parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<crate::obs::ObsCommand>>>,
     /// Audio mode forced via `--audio-mode` (the OBS plugin passes
     /// `obs_filter`). While set, admin-panel config patches can never
     /// change `audio.mode`, so saving other settings can't break the
@@ -100,6 +112,37 @@ pub struct AppState {
     /// 再也看不出来。管理页要如实告诉用户"你填的值超出 −1~1，实际按边界值
     /// 下发"，只能靠这个运行期标记。用户下次保存一个合法值时会清掉。
     pub speech_noise_threshold_clamped: std::sync::atomic::AtomicBool,
+    /// Access tokens for the HTTP/WebSocket server (P0-01). The overlay token is
+    /// read-only and separate from the admin token, so the URL pasted into an
+    /// OBS Browser Source cannot change settings or stop recognition.
+    pub tokens: crate::auth::TokenPair,
+    /// `host:port` the server actually serves on, used to validate the `Origin`
+    /// header against this server's own origin.
+    pub bind_addr: (String, u16),
+    /// True when the operator deliberately configured authentication (env var or
+    /// a pre-existing `tokens.toml`). A token this process generated for itself
+    /// is not evidence that binding a public interface was intended, so
+    /// `auth::bind_policy` uses this to decide whether to refuse startup.
+    pub auth_configured: bool,
+    /// 外送链路信任域（P0-02）：内存中 `llm.api_key` 当前被允许发往的端点主机。
+    /// 端点换成另一个信任域时，旧 Key 必须失效并要求用户重新确认/输入，而不是
+    /// 被静默发往新主机。
+    pub llm_key_domain: parking_lot::Mutex<Option<String>>,
+    /// OBS 插件通过 `--ingest-nonce` 一次性传入的握手身份（P0-05）。
+    pub ingest_nonce: Option<Arc<str>>,
+    /// Serialises the whole read-modify-write cycle of a config save (P2-02):
+    /// two concurrent `POST /api/config` requests must not interleave into a
+    /// lost update.
+    pub config_write_lock: parking_lot::Mutex<()>,
+    /// Absolute path of the config file this process loaded.
+    ///
+    /// Held here rather than only in the `CONFIG_PATH` `OnceLock` so the request
+    /// handlers can validate a patch against the directory the config really
+    /// lives in. The `OnceLock` cannot be set by a test, and validating against
+    /// its default (`"config.toml"`, whose parent is `.`) made every absolute
+    /// `recording_dir` look "inside the config directory" — the check silently
+    /// passed for exactly the case it exists to refuse.
+    pub config_path: std::path::PathBuf,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -169,8 +212,7 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
 
-    let cfg_path = resolve_config_path(cli.config.clone())
-        .context("resolve config path")?;
+    let cfg_path = resolve_config_path(cli.config.clone()).context("resolve config path")?;
     let _ = CONFIG_PATH.set(cfg_path.clone());
     info!(
         path = %cfg_path.display(),
@@ -179,6 +221,30 @@ async fn main() -> Result<()> {
     );
     let mut cfg = Config::load_or_create(&cfg_path)
         .with_context(|| format!("load config {}", cfg_path.display()))?;
+
+    // P0-04 upgrade path: a config on disk was written before these boundaries
+    // existed, so it can hold a value a *patch* would now be rejected for. The
+    // one that really shipped is `audio.sample_rate = 0`, which used to mean
+    // "device default" and now has no meaning — every producer emits a fixed
+    // internal rate, so the value the VAD is told would disagree with the rate
+    // the frames were made at. Those files would otherwise fail validation and
+    // silently stop recognising audio, so the legacy sentinel is rewritten once,
+    // loudly. Everything else that cannot be normalised safely is reported and
+    // left untouched.
+    if cfg.audio.sample_rate == 0 {
+        warn!(
+            "config.toml 里 audio.sample_rate = 0（旧版“设备默认”写法）已不再支持，\
+             已按内部固定采样率 {} Hz 纠正；请到管理页保存一次以写回磁盘",
+            crate::pipeline::INTERNAL_SAMPLE_RATE
+        );
+        cfg.audio.sample_rate = crate::pipeline::INTERNAL_SAMPLE_RATE;
+    }
+    match cfg.validate(&cfg_path) {
+        Ok(()) => {}
+        Err(errors) => {
+            warn!(errors = %errors, "config.toml 存在超出允许范围的值；管线会拒绝启动，请在管理页修正");
+        }
+    }
 
     if let Ok(dir) = resolve_static_dir() {
         cfg.server.static_dir = dir;
@@ -203,6 +269,39 @@ async fn main() -> Result<()> {
         info!(port, "audio ingest port overridden for this process only");
     }
 
+    // ---------------------------------------------------------------------
+    // Access control (P0-01). Decided BEFORE anything is spawned: a bind that
+    // would expose the admin API without authentication must stop the process,
+    // not log a warning and carry on.
+    // ---------------------------------------------------------------------
+    let tokens_file = auth::tokens_path(&cfg_path);
+    let had_token_file = tokens_file.exists();
+    let tokens = match (&cli.admin_token, &cli.overlay_token) {
+        // Both supplied from the environment / command line.
+        (Some(admin), Some(overlay)) => {
+            let pair = auth::TokenPair {
+                admin: admin.clone(),
+                overlay: overlay.clone(),
+            };
+            if !pair.is_valid() {
+                anyhow::bail!(
+                    "SLT_ADMIN_TOKEN 和 SLT_OVERLAY_TOKEN 必须是不同的 64 位十六进制令牌"
+                );
+            }
+            pair
+        }
+        (None, None) => auth::load_or_create(&cfg_path)
+            .with_context(|| format!("create access tokens at {}", tokens_file.display()))?,
+        _ => anyhow::bail!("必须同时提供 SLT_ADMIN_TOKEN 和 SLT_OVERLAY_TOKEN"),
+    };
+    let auth_configured = cli.admin_token.is_some() || had_token_file;
+    if let auth::BindPolicy::Refuse(message) = auth::bind_policy(&cfg.server.host, auth_configured)
+    {
+        // Hard failure: exiting non-zero is the only honest outcome here.
+        anyhow::bail!("{message}");
+    }
+    let bind_addr = (cfg.server.host.clone(), cfg.server.port);
+
     let subtitle = Arc::new(subtitle::SubtitleHub::default());
     let pipeline = Arc::new(pipeline::PipelineHandle::new());
     let status = Arc::new(RwLock::new(AppStatus::default()));
@@ -212,6 +311,9 @@ async fn main() -> Result<()> {
     // 热词（R10）：启动时先用配置里的词表初始化 feed，Provider 一建会话就能带上。
     let hotwords = crate::hotwords::HotwordFeed::new();
     hotwords.set(crate::hotwords::plan(&cfg.llm.hotwords));
+
+    // 外送链路（P0-02）：磁盘上的 Key 只对它当初配对的端点主机有效。
+    let initial_key_domain = crate::llm::trust_domain(&cfg.llm);
 
     let state = Arc::new(AppState {
         config: Arc::new(RwLock::new(cfg.clone())),
@@ -226,9 +328,32 @@ async fn main() -> Result<()> {
         hotword_status: Arc::new(RwLock::new(crate::hotwords::HotwordStatus::default())),
         hotwords,
         speech_noise_threshold_clamped: std::sync::atomic::AtomicBool::new(false),
+        tokens: tokens.clone(),
+        bind_addr: bind_addr.clone(),
+        auth_configured,
+        llm_key_domain: parking_lot::Mutex::new(initial_key_domain),
+        ingest_nonce: cli.ingest_nonce.as_deref().map(Arc::from),
+        config_write_lock: parking_lot::Mutex::new(()),
+        config_path: cfg_path.clone(),
     });
 
     recording::spawn(state.recording.clone(), state.clone());
+
+    // P1-06 / P2-07: apply the persistence switch and the retention policy that
+    // the config (or the panel) asked for. Both are explicit: no recording is
+    // deleted unless `retention_days` is non-zero, and turning persistence off
+    // never removes what is already on disk.
+    state.recording.set_enabled(cfg.auto_persist);
+    if cfg.retention_days > 0 {
+        let removed = state.recording.prune_older_than(cfg.retention_days);
+        if removed > 0 {
+            info!(
+                removed,
+                days = cfg.retention_days,
+                "removed expired subtitle recordings"
+            );
+        }
+    }
 
     pipeline::spawn(state.clone(), cfg_path.clone());
 
@@ -240,9 +365,13 @@ async fn main() -> Result<()> {
     let obs_client = obs::spawn(state.clone());
     *state.obs_cmd_tx.lock() = obs_client.lock().sender();
 
+    // The in-OBS dock hosts the admin panel, so it needs the *admin* token —
+    // without it the browser source loads a panel that gets 401 on every call.
+    // The token is injected into the page anyway, but the first navigation has
+    // to carry it, and an OBS browser source is a plain URL.
     let admin_url = format!(
-        "http://{}:{}/admin?obsDock=1",
-        cfg.server.host, cfg.server.port
+        "http://{}:{}/admin?obsDock=1&token={}",
+        cfg.server.host, cfg.server.port, state.tokens.admin
     );
     obs_client.lock().set_admin_url(admin_url);
 
@@ -257,7 +386,10 @@ async fn main() -> Result<()> {
     });
 
     if cli.open {
-        let url = format!("http://{}:{}/admin", cfg.server.host, cfg.server.port);
+        let url = format!(
+            "http://{}:{}/admin?token={}",
+            cfg.server.host, cfg.server.port, state.tokens.admin
+        );
         if let Err(e) = open_in_browser(&url) {
             warn!(error = %e, "failed to open admin page");
         }
@@ -286,10 +418,7 @@ fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,stream_live_translate=info"));
-    fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
+    fmt().with_env_filter(filter).with_target(false).init();
 }
 
 fn open_in_browser(url: &str) -> Result<()> {

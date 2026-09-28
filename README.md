@@ -2,21 +2,21 @@
 
 > 实时 AI 字幕 / 同声传译 OBS 插件 —— 从 OBS 媒体源内部取音频 + 大模型流式翻译 + 浏览器源字幕叠加。
 
-**免安装：把插件文件夹复制进 OBS 的插件目录就能用。**OBS 启动时插件自动拉起内置引擎，给任意源挂上“实时字幕捕获”滤镜，填上你自己的大模型 API Key，中文字幕就出现在直播画面上了。详细安装/使用/编译说明见 [docs/PLUGIN.md](docs/PLUGIN.md)。
+**Windows 解压后双击安装；Linux/macOS 把插件复制进 OBS 插件目录即可。** OBS 启动时插件自动拉起内置引擎，给任意源挂上“实时字幕捕获”滤镜，填上你自己的大模型 API Key，中文字幕就出现在直播画面上了。详细安装/使用/编译说明见 [docs/PLUGIN.md](docs/PLUGIN.md)。
 
-## v0.1.0 变更
+## v0.0.26 变更
 
 - **隐藏控制台窗口**：插件模式下不再弹出黑色 cmd 窗口（Rust 引擎改为 `windows_subsystem = "windows"`）。
 - **重写 admin 面板**：明显按钮反馈（按下时缩放 + 颜色变化）、Toast 移到屏幕底部不会丢失、文件导入支持 SRT / VTT / TXT / JSON（可把字幕加到历史区试听样式）、拖放导入、任何 JS 错误都直接显示在面板上的红色覆盖层方便排查。
 - **WebSocket 状态可视化**：顶栏新增「WS 已连接 / 已断开 / 连接中」徽标，断线自动重连有提示。
-- **缓存防错乱**：CSS / JS URL 升级 `?v=0.1.0`，避免浏览器拉了旧版。
+- **缓存防错乱**：CSS / JS URL 带 `?v=` 缓存击穿串，取值等于 `Cargo.toml` 的权威版本号（当前 `0.0.26`），由 `scripts/sync-version.ps1 -Fix` / `scripts/sync-version.sh --fix` 统一改写，规则见 [docs/BUILD.md](docs/BUILD.md#asset-cache-busting-policyv)。
 - **OBS 侧边栏 dock 样式**精简，更适合窄栏。
 
 ## 功能一览
 
 | 功能 | 说明 |
 | --- | --- |
-| OBS 原生插件 | 复制插件文件夹到 OBS 插件目录即用，无需安装器；OBS 启动自动拉起引擎、退出自动回收 |
+| OBS 原生插件 | Windows 发布包含一键安装与校验；OBS 启动自动拉起引擎、退出自动回收 |
 | OBS 内部取音频 | 音频滤镜直接捕获媒体源等任意源的声音，不受系统其它声音干扰 |
 | 跨平台 | Windows 10/11 x64、Linux x64（Debian 11+/Ubuntu 20.04+）、macOS 13+（Apple Silicon） |
 | 侧边栏控制台 | 管理面板通过 OBS 自带“自定义浏览器停靠部件”钉在侧边栏，填 Key/调样式不用切出 OBS |
@@ -87,17 +87,20 @@ speech-to-speech serve --host 0.0.0.0 --stt parakeet-tdt --enable_live_transcrip
 
 ## 快速使用（插件模式）
 
-### 1. 安装插件（复制即用）
+### 1. 安装插件
 
-从 Releases 下载对应平台的插件包（`stream-live-translate-obs-<平台>-<版本>.zip/.tar.gz`），解压后把 `stream-live-translate` 文件夹放进：
+从 Releases 下载对应平台的插件包（`stream-live-translate-obs-<平台>-<版本>.zip/.tar.gz`）。
+
+Windows：关闭 OBS，解压后双击 `stream-live-translate\双击安装.cmd`。
+
+Linux/macOS：解压后把 `stream-live-translate` 文件夹放进：
 
 | 平台 | 插件目录（推荐，无需管理员权限） |
 | --- | --- |
-| Windows | `%APPDATA%\obs-studio\plugins\` |
 | Linux | `~/.config/obs-studio/plugins/` |
 | macOS | `~/Library/Application Support/obs-studio/plugins/` |
 
-也可以放进 OBS 安装目录下的 `plugins\` 文件夹。然后启动/重启 OBS。
+然后启动/重启 OBS。
 
 ### 2. 挂音频滤镜（告诉插件听哪个源）
 

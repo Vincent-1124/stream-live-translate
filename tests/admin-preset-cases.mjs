@@ -33,10 +33,53 @@ const REPO = path.resolve(HERE, "..");
 const PANEL_JS = fs.readFileSync(path.join(REPO, "admin", "app.js"), "utf8");
 const PANEL_HTML = fs.readFileSync(path.join(REPO, "admin", "index.html"), "utf8");
 
+/**
+ * The source `bootPanel()` actually executes.  Identical to the file on disk
+ * unless a negative control swaps in a deliberately re-broken variant with
+ * [`setPanelSource`] — the file itself is never written.
+ */
+let panelSource = PANEL_JS;
+
+/** Negative-control hook: run every later `bootPanel()` from this source. */
+export function setPanelSource(source) {
+  panelSource = String(source);
+}
+
+/** The source currently under test (pristine unless a control swapped it). */
+export function getPanelSource() {
+  return panelSource;
+}
+
 export const results = [];
+
+/// Let pending microtasks run.
+///
+/// `check()` used to be synchronous, so every `check(name, async () => …)` in
+/// this file had its assertions **silently discarded**: the callback returned a
+/// pending promise, the case was recorded `ok`, and the footer exited before the
+/// assertion ever ran. Draining the queue after each case is what makes those
+/// seven cases real — and it is how the wiring defect below was found.
+async function drainMicrotasks(rounds = 60) {
+  for (let i = 0; i < rounds; i++) await Promise.resolve();
+}
+
 function check(name, fn) {
   try {
-    fn();
+    const value = fn();
+    if (value && typeof value.then === "function") {
+      // Async case: record it as failed unless the promise settles.
+      results.push(
+        value.then(
+          () => ({ name, ok: true }),
+          (error) => ({
+            name,
+            ok: false,
+            error: error && error.stack ? error.stack : String(error),
+          }),
+        ),
+      );
+      return;
+    }
     results.push({ name, ok: true });
   } catch (error) {
     results.push({ name, ok: false, error: error && error.stack ? error.stack : String(error) });
@@ -48,7 +91,7 @@ function check(name, fn) {
 // ---------------------------------------------------------------------------
 
 /** Default `/api/config` payload the panel boots with. */
-function baseConfig(overrides = {}) {
+export function baseConfig(overrides = {}) {
   return {
     server: { host: "127.0.0.1", port: 8897, static_dir: "dist" },
     llm: {
@@ -105,14 +148,53 @@ function baseConfig(overrides = {}) {
   };
 }
 
+/** Select ids the panel reads, in markup order. */
+const SELECT_IDS = ["audio-mode", "filter-preset", "target_lang", "ov-display-delay",
+                    "ov-clear-after", "ov-position", "ov-animation", "segment_ms"];
+
+/**
+ * The `<option value>` list every `<select>` in `admin/index.html` offers.
+ *
+ * A real browser's `select.value` drops a value the markup does not offer and
+ * `setSelectValue()` chooses among `sel.options`; a stub with `options = []`
+ * can model neither, so the select-related zero/fallback bugs would be
+ * invisible to the suite.
+ */
+export function parseSelectOptions(html = PANEL_HTML) {
+  const out = {};
+  const blocks = html.matchAll(/<select\b[^>]*\bid="([^"]+)"[^>]*>([\s\S]*?)<\/select>/g);
+  for (const [, id, body] of blocks) {
+    out[id] = [...body.matchAll(/<option\b[^>]*\bvalue="([^"]*)"/g)].map((m) => m[1]);
+  }
+  return out;
+}
+
 /**
  * Boot `admin/app.js` against the DOM shim.
  *
  * Returns the document, the recorded `fetch` calls and the panel's own
  * `collectPatch()` result (captured by intercepting the save POST).
+ *
+ * @param {object}   [opts]
+ * @param {object}   [opts.config]         payload for `GET /api/config`
+ * @param {object}   [opts.statusOverrides] extra `/api/status` fields
+ * @param {object}   [opts.configStore]    optional fake server: `{ read(), write(patch) }`.
+ *   When given, GET returns `read()` and POST is handed to `write()`, so a save
+ *   followed by the panel's own re-`loadConfig()` (or a second boot, i.e. a page
+ *   reload) round-trips through the stored value instead of a frozen fixture.
+ * @param {boolean}  [opts.selectOptions]  populate `sel.options` from the markup
+ *   and make `sel.value` behave like a browser (a value the markup does not
+ *   offer leaves the select blank). Default true.
  */
-export async function bootPanel({ config = baseConfig(), statusOverrides = {} } = {}) {
+export async function bootPanel({
+  config = baseConfig(),
+  statusOverrides = {},
+  configStore = null,
+  selectOptions = true,
+} = {}) {
   const doc = createDocument({ html: PANEL_HTML, clock: undefined });
+  const previewViewport = doc.getElementById("preview-obs-viewport");
+  if (previewViewport) previewViewport.parentElement = { clientWidth: 1000 };
 
   // --- the shim extensions the panel needs ---------------------------------
   // The overlay never sets attributes or disables a control, so the shim has no
@@ -137,14 +219,35 @@ export async function bootPanel({ config = baseConfig(), statusOverrides = {} } 
   };
   doc._elements.forEach(extend);
   // `<select>.options` is iterated by fillForm (`[...sel.options]`) and by
-  // `setSelectValue`, so select stubs need an (empty) option list.  The panel
-  // then appends the configured value as a fresh option, exactly like a browser
-  // for a value the markup does not offer.
-  const SELECT_IDS = ["audio-mode", "filter-preset", "target_lang", "ov-display-delay",
-                      "ov-clear-after", "ov-position", "ov-animation", "segment_ms"];
+  // `setSelectValue`, so select stubs need an option list.  With
+  // `selectOptions` (the default) it is the real one parsed out of the markup,
+  // and `value` is a browser-like accessor: assigning a value no `<option>`
+  // offers leaves the select BLANK — the failure mode `setSelectValue()` exists
+  // to prevent.  A stub with `options = []` and no accessor accepts anything,
+  // which hides exactly the bugs this harness is supposed to catch.
+  const markupOptions = selectOptions ? parseSelectOptions() : null;
   for (const id of SELECT_IDS) {
     const sel = doc.getElementById(id);
-    if (sel) sel.options = [];
+    if (!sel) continue;
+    const values = markupOptions && markupOptions[id] ? [...markupOptions[id]] : [];
+    sel.options = values.map((value) => ({ value, textContent: value }));
+    if (values.length === 0) continue;
+    let current = "";
+    Object.defineProperty(sel, "value", {
+      get: () => current,
+      set: (v) => { const s = String(v); current = values.includes(s) ? s : ""; },
+      enumerable: true,
+      configurable: true,
+    });
+    // `fillForm` appends an option for a value the markup does not offer (e.g. a
+    // hand-edited audio.mode); a real browser would then have it in `options`.
+    const appendChild = sel.appendChild.bind(sel);
+    sel.appendChild = (child) => {
+      appendChild(child);
+      const v = child && child.value !== undefined ? String(child.value) : "";
+      if (v && !values.includes(v)) values.push(v);
+      return child;
+    };
   }
   const origCreate = doc.createElement;
   doc.createElement = (tag) => extend(origCreate(tag));
@@ -186,7 +289,7 @@ export async function bootPanel({ config = baseConfig(), statusOverrides = {} } 
     calls.push({ url, method: opts.method || "GET", body });
     let payload = {};
     if (url.endsWith("/api/config") && (opts.method || "GET") === "GET") {
-      payload = config;
+      payload = configStore ? configStore.read() : config;
     } else if (url.endsWith("/api/status")) {
       payload = status;
     } else if (url.endsWith("/api/recordings")) {
@@ -196,6 +299,7 @@ export async function bootPanel({ config = baseConfig(), statusOverrides = {} } 
     } else if (url.endsWith("/api/devices")) {
       payload = [];
     } else if (url.endsWith("/api/config") && opts.method === "POST") {
+      if (configStore) configStore.write(body);
       payload = { ok: true };
     }
     return { ok: true, status: 200, json: async () => payload, text: async () => "" };
@@ -203,6 +307,7 @@ export async function bootPanel({ config = baseConfig(), statusOverrides = {} } 
 
   // `vm` keeps the panel's `$()` closure bound to THIS document, even while the
   // test drives several panels in one process.
+  const wsInstances = [];
   const sandbox = {
     console: {
       log: (...a) => { if (process.env.ADMIN_TEST_DEBUG) console.error("[panel log]", ...a); },
@@ -216,7 +321,7 @@ export async function bootPanel({ config = baseConfig(), statusOverrides = {} } 
     location: { protocol: "http:", host: "127.0.0.1:8897", search: "", href: "http://127.0.0.1:8897/admin" },
     localStorage: createLocalStorage(),
     getComputedStyle: () => ({ fontSize: "48px", lineHeight: "60px", getPropertyValue: () => "" }),
-    WebSocket: createWebSocketStub({ instances: [] }),
+    WebSocket: createWebSocketStub({ instances: wsInstances }),
     fetch: fetchImpl,
     // Timers never fire: every assertion in this file is synchronous.
     setTimeout: () => 0,
@@ -251,11 +356,13 @@ export async function bootPanel({ config = baseConfig(), statusOverrides = {} } 
   sandbox.window.removeEventListener = () => {};
 
   const context = vm.createContext(sandbox);
-  vm.runInContext(PANEL_JS, context, { filename: "admin/app.js" });
+  vm.runInContext(panelSource, context, { filename: "admin/app.js" });
   for (let i = 0; i < 200; i++) await Promise.resolve();
 
   return {
     doc,
+    sandbox,
+    wsInstances,
     calls,
     debugErrors,
     el: (id) => doc.getElementById(id),
@@ -276,6 +383,23 @@ const PRESET_EXPECTATIONS = [
 
 export async function run() {
   results.length = 0;
+  // `check()` records an async case as a promise; `run()` must await them all or
+  // the assertions are discarded again (that was the original defect).
+  const settle = async () => {
+    await drainMicrotasks();
+    const pending = results.filter((entry) => entry && typeof entry.then === "function");
+    if (pending.length) {
+      const settled = await Promise.all(pending);
+      // Replace the promise entries with their settled result, in place, so the
+      // reported order still matches the source order.
+      let i = 0;
+      for (let idx = 0; idx < results.length; idx++) {
+        if (results[idx] && typeof results[idx].then === "function") {
+          results[idx] = settled[i++];
+        }
+      }
+    }
+  };
 
   const panel = await bootPanel({
     config: baseConfig({ llm: { speech_noise_threshold: 0.9 } }),
@@ -405,10 +529,25 @@ export async function run() {
     assert.ok(status.textContent.includes("当前生效值 0.9"), status.textContent);
   });
 
+  // The final preset case pushes a `filter-preset` change whose save assertion
+  // runs after the current microtask, so give it its slice before returning.
+  await drainMicrotasks();
+  await settle();
+
   return results;
 }
 
 // Allow `node tests/admin-preset-cases.mjs` for a direct run.
+//
+// History: `check()` used to be synchronous, so every `check(name, async () => …)`
+// in this file had its assertions **silently discarded** — the case was recorded
+// `ok` the moment the async callback returned a pending promise, and the footer's
+// `process.exit()` discarded the rest. Making the harness await-aware exposed a
+// real wiring defect it had been hiding: `collectPatch()` posted the cloud
+// threshold as `filter.speech_noise_threshold` while the server reads
+// `llm.speech_noise_threshold`, so choosing a 过滤预设 never reached the cloud.
+// Both are fixed: the panel now sends `llm.speech_noise_threshold`, and this
+// suite actually asserts the async cases.
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
   const list = await run();
   let failed = 0;

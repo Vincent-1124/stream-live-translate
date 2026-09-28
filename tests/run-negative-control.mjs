@@ -34,10 +34,10 @@ const APP_JS_PATH = path.join(TESTS_DIR, "..", "overlay", "app.js");
 /** One-line, anchor-checked source perturbations (in memory only). */
 export const PERTURBATIONS = {
   "two-line-cap": {
-    description: "max line clamp in renderStyle(): `if (lines > 2) lines = 2;` -> `lines = 4;`",
+    description: "max line clamp in renderStyle(): `if (lines > 4) lines = 4;` -> `lines = 6;`",
     apply(src) {
-      const from = "    if (lines > 2) lines = 2;";
-      const to = "    lines = 4;";
+      const from = "    if (lines > 4) lines = 4;";
+      const to = "    lines = 6;";
       if (!src.includes(from)) throw new Error(`anchor not found: ${JSON.stringify(from)}`);
       return src.replace(from, to);
     },
@@ -62,22 +62,15 @@ export const PERTURBATIONS = {
       return src.replace(from, "    partialBuffer = partialBuffer + next;");
     },
   },
-  // Regression guard for the page-boundary bug that used to live in pickShown()
-  // (`return full.slice(pageStart);`).  The current source is fixed, so this
-  // perturbation re-introduces the old behaviour and the suite must catch it.
+  // Regression guard: bypass the measured sliding window and render the full
+  // sentence, which must break the configured line cap.
   "page-boundary-regression": {
     description:
-      "pickShown(): render from pageStart to the end again (the historical off-by-one)",
+      "pickShown(): render the unbounded sentence instead of the measured window",
     apply(src) {
-      const from = [
-        "    const shown = full.slice(pageStart, cut);",
-        "    // 空页面绝不允许进 DOM —— 一帧空白同样是用户看得见的闪烁。",
-        "    if (!shown) return full.slice(0, cut) || full.slice(0, 1);",
-        "    pageStart = cut;",
-        "    return shown;",
-      ].join("\n");
+      const from = "    return full.slice(pageStart);";
       if (!src.includes(from)) throw new Error(`anchor not found: ${JSON.stringify(from)}`);
-      return src.replace(from, "    return full.slice(pageStart);");
+      return src.replace(from, "    return full;");
     },
   },
   // Regression guard for the long-sentence page flicker (user report #2).  The
@@ -100,16 +93,23 @@ export const PERTURBATIONS = {
       return src.replace(from, "    return next.startsWith(prev) || prev.startsWith(next);");
     },
   },
-  // Regression guard for the rebase: a revision that shortens the sentence under
-  // the page cursor must move the cursor onto the LAST page that still fits,
-  // never restart it at page 1 and never render an empty page.
+  // Regression guard for the rebase: a shortened revision must not render a
+  // blank frame after the cursor reaches the end of the text.
   "page-cursor-restart": {
     description:
-      "pickShown(): `pageStart >= full.length` -> `pageStart > full.length` + reset to 0",
+      "pickShown(): keep an out-of-bounds cursor after a shortened revision",
     apply(src) {
-      const from = "    if (pageStart >= full.length) pageStart = findLastPageStart(full, maxH);";
+      const from = "    pageStart = pageStart >= full.length ? start : Math.max(pageStart, start);";
       if (!src.includes(from)) throw new Error(`anchor not found: ${JSON.stringify(from)}`);
-      return src.replace(from, "    if (pageStart > full.length) pageStart = 0;");
+      return src.replace(from, "    pageStart = Math.max(pageStart, start);");
+    },
+  },
+  "typewriter-window-reset": {
+    description: "displayShown(): flash one character on corrections and new sentences",
+    apply(src) {
+      const from = "      typePos = shown.length;\n      textEl.textContent = shown;\n      return;";
+      if (!src.includes(from)) throw new Error(`anchor not found: ${JSON.stringify(from)}`);
+      return src.replace(from, "      typePos = nextUnitEnd(shown, 0);\n      textEl.textContent = shown.slice(0, typePos);\n      return;");
     },
   },
   // Regression guard for the new "0 秒（无缓冲）" option.

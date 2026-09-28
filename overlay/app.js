@@ -139,10 +139,10 @@
     const r = Number(style.radius);
     root.setProperty("--caption-radius", (isFinite(r) && r >= 0 ? r : 8) + "px");
 
-    // 直播字幕固定最多两行。长句由分页逻辑推进，不能靠增高区域塞第三行。
+    // 行数由管理页设置，超限的长句由分页逻辑推进。
     let lines = Math.round(Number(style.maxLines));
     if (!isFinite(lines) || lines < 1) lines = 2;
-    if (lines > 2) lines = 2;
+    if (lines > 4) lines = 4;
     maxLines = lines;
     lineEl.classList.toggle("single-line", lines <= 1);
 
@@ -156,16 +156,9 @@
     refreshCaption();
   }
 
-  // ---- 长句换句显示 -----------------------------------------------------
-  // 英文新闻、访谈这类长句超过「最大行数」时，多出来的部分直接换到下一句
-  // 字幕显示 —— 不做任何滚动或位移动画。
-  //
-  // 做法是「分页跟随」：文字一边流式增长一边实时显示（所以半句话就能立刻
-  // 看到），一旦当前这句超过最大行数，就从超出的地方另起一句，字幕内容
-  // 整块替换成新的一句。前面那句在增长过程中已经被实时显示过了，不会丢。
-  //
-  // 只有两个 DOM 操作：测量高度 + 写入文本，没有 transform 也没有定时器，
-  // 因此没有延迟累积。
+  // ---- 长句显示 ---------------------------------------------------------
+  // 流式识别时始终显示最新内容。超过行数上限后保留能容纳的最长尾部，
+  // 而不是立刻跳到只有几个字的下一页；起点尽量对齐词边界。
 
   let pageStart = 0; // 当前这句在完整文本中的起始字符下标
 
@@ -179,31 +172,25 @@
     return h;
   }
 
-  /**
-   * 找换句位置：从 start 起，能塞进一屏的最长片段的结束下标。
-   * 二分查找而非逐字符试排 —— 后者每次 partial 都要几十次强制重排，
-   * 会直接把字幕拖出可感知的延迟。
-   */
-  function findCut(text, start, maxH) {
-    let lo = start + 1;
-    let hi = text.length;
-    let best = start + 1;
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1;
-      if (measureHeight(text.slice(start, mid)) <= maxH) {
-        best = mid;
-        lo = mid + 1;
-      } else {
-        hi = mid - 1;
+  const wordSegmenter = typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter("zh", { granularity: "word" }) : null;
+  function wordAlignedStart(text, start) {
+    if (start === 0 || start >= text.length) return start;
+    if (wordSegmenter) {
+      for (const part of wordSegmenter.segment(text)) {
+        if (part.index >= start && part.isWordLike) return part.index;
+      }
+    } else {
+      for (let i = start; i < text.length; i++) {
+        if (/\s/.test(text[i - 1]) && !/\s/.test(text[i])) return i;
       }
     }
-    return best;
+    // 单个超长词本身超过上限时只能硬截；至少不要截断代理对。
+    if (/[\uDC00-\uDFFF]/.test(text[start]) && /[\uD800-\uDBFF]/.test(text[start - 1])) start++;
+    return start;
   }
 
-  /// 最后一页的起始下标：满足 `full.slice(start)` 仍能塞进一屏的最小 start。
-  /// 修订改写了光标附近的文本、或字号/行数变化导致光标越界时，用它**重新定位
-  /// 光标**而不是把光标打回 0 —— 打回 0 会让字幕从第一页重新出现，观感上就是
-  /// 「第一段字幕和第二段字幕交替闪烁」；光标恰好等于全文长度时还会渲染出空白帧。
+  /// 满足 `full.slice(start)` 仍能塞进视口的最小 start。
   function findLastPageStart(full, maxH) {
     let lo = 0;
     let hi = full.length;
@@ -227,29 +214,17 @@
     displayShown(shown);
   }
 
-  /// 决定应显示哪一段：单行模式全文给 CSS 省略号；多行超限时从溢出处另起。
+  /// 决定应显示哪一段：单行模式全文给 CSS 省略号；多行显示最新的完整窗口。
   function pickShown(full) {
     if (maxLines <= 1) return full;
     const lh = parseFloat(getComputedStyle(captionEl).lineHeight) || 0;
     const maxH = maxLines * lh;
     if (maxH <= 0) return full;
-    // 修订可能改写光标所在的文本（累计修订的尾巴经常变），文本也可能变短到
-    // 光标越界。这里只**重新定位**光标到"还能装下的最后一页"，绝不推回第 1 页。
-    if (pageStart >= full.length) pageStart = findLastPageStart(full, maxH);
-    const cut = findCut(full, pageStart, maxH);
-    // Only hand the whole tail over when the tail itself fits on one page.
-    // Otherwise render EXACTLY the measured slice: `cut` is the END index of
-    // the longest slice that fits (findCut's binary search returns `best` from
-    // `full.slice(start, mid)`), so anything past `cut` belongs to the next
-    // page. Returning `full.slice(pageStart)` here was the off-by-one that let
-    // a page render one character more than was ever measured, which put a
-    // third line on screen for cumulative-revision (`replace: true`) streams.
-    if (cut >= full.length) return full.slice(pageStart);
-    const shown = full.slice(pageStart, cut);
-    // 空页面绝不允许进 DOM —— 一帧空白同样是用户看得见的闪烁。
-    if (!shown) return full.slice(0, cut) || full.slice(0, 1);
-    pageStart = cut;
-    return shown;
+    if (!full) return full;
+    const start = wordAlignedStart(full, findLastPageStart(full, maxH));
+    // ASR 修订偶尔缩短尾巴，不能因此跳回旧的第一页；真正越界时重新定位。
+    pageStart = pageStart >= full.length ? start : Math.max(pageStart, start);
+    return full.slice(pageStart);
   }
 
   /// 文字或行数/字号变化后重画当前这句。
@@ -335,23 +310,18 @@
       if (textEl.textContent !== shown) textEl.textContent = shown;
       return;
     }
-    // 同一句的延展（partial 追加 / final 收尾）：游标不动，继续打增量。
-    // 全新内容（换句 / 修正）：从头逐单位打。
-    const sameSentence = typeTarget && shown.startsWith(typeTarget);
-    typeTarget = shown;
-    if (!sameSentence) {
-      typePos = 0;
+    // ponytail: 非追加修订、新句和窗口前移一次性替换；只让真正追加的部分逐字出现。
+    // 这样不会在每次更正时先清空，再闪出一个字和突然变窄的背景。
+    if (!typeTarget || !shown.startsWith(typeTarget)) {
+      stopTyping();
       setUnitMode(shown);
-      textEl.textContent = "";
+      typeTarget = shown;
+      typePos = shown.length;
+      textEl.textContent = shown;
+      return;
     }
+    typeTarget = shown;
     if (typePos > typeTarget.length) typePos = typeTarget.length;
-    // 首个单位同步写出：display_delay_ms = 0 承诺「不做任何缓冲」，页面一到达
-    // 就必须看得见，而不是等一个打字间隔（32 / 55 ms）才蹦出第一个字。
-    // 只有第一个单位走这条路径，后面的单位仍按原节奏逐字 / 逐词显示。
-    if (typePos === 0 && typeTarget.length > 0) {
-      typePos = nextUnitEnd(typeTarget, 0);
-      textEl.textContent = typeTarget.slice(0, typePos);
-    }
     if (typePos < typeTarget.length) {
       if (!typeTimer) {
         typeTimer = setTimeout(typeTick, typeMode === "word" ? TYPE_WORD_MS : TYPE_CHAR_MS);
@@ -601,10 +571,39 @@
 
   // ---- transport ---------------------------------------------------------
 
+  /// 访问令牌（P0-01）。
+  ///
+  /// 服务端给管理接口和字幕 WebSocket 都加了鉴权，overlay 用的是**只读令牌**：
+  /// 它能读字幕和样式，但改配置 / 停管线 / 读录像都会被拒。令牌有三个来源，
+  /// 按优先级取第一个可用的：
+  ///   1. `window.__SLT_TOKEN__` —— 服务端渲染 /overlay 时注入的（推荐路径，
+  ///      令牌不会出现在 URL 里，因此不进浏览器历史、Referer 和访问日志）；
+  ///   2. URL 的 `?token=` —— OBS 浏览器源直接填的地址，服务端也会注入同一
+  ///      个值，这里作为兜底；
+  ///   3. 空 —— 旧版服务端或手工打开的文件，此时请求会被拒绝，而不是拿到别
+  ///      人的数据。
+  function accessToken() {
+    const injected = typeof window !== "undefined" && typeof window.__SLT_TOKEN__ === "string"
+      ? window.__SLT_TOKEN__
+      : "";
+    if (injected) return injected;
+    try {
+      return new URLSearchParams(location.search).get("token") || "";
+    } catch {
+      return "";
+    }
+  }
+
+  /// 所有 API 请求都带上令牌。用请求头而不是查询参数，避免令牌进入日志。
+  function authHeaders(extra) {
+    const token = accessToken();
+    return token ? Object.assign({ "x-slt-token": token }, extra || {}) : (extra || {});
+  }
+
   /// admin 保存配置后由服务端 /api/config 广播推来，overlay 立即重刷样式。
   async function loadConfig() {
     try {
-      const r = await fetch("/api/config", { cache: "no-store" });
+      const r = await fetch("/api/config", { cache: "no-store", headers: authHeaders() });
       const cfg = await r.json();
       if (cfg.overlay) applyOverlayConfig(cfg.overlay);
     } catch (e) {
@@ -635,7 +634,12 @@
     stopWsTimers();
     const generation = ++wsGeneration;
     const wsScheme = location.protocol === "https:" ? "wss" : "ws";
-    const url = `${wsScheme}://${location.host}/ws/subtitles`;
+    // 令牌走查询参数：浏览器的 WebSocket 构造函数不能自定义请求头。
+    // 这也是服务端把令牌注入页面的原因之一——同一个令牌两处都用，用户不必
+    // 手工拼接 URL。
+    const token = accessToken();
+    const url = `${wsScheme}://${location.host}/ws/subtitles` +
+      (token ? `?token=${encodeURIComponent(token)}` : "");
     try {
       ws = new WebSocket(url);
     } catch (e) {

@@ -26,7 +26,25 @@ STAGE="$ROOT/build/stage-unix"
 step() { printf '\n==> %s\n' "$*"; }
 
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -n1)"
+if [ -z "$VERSION" ]; then
+    echo "FATAL: could not read the version from $ROOT/Cargo.toml" >&2
+    echo "       Cargo.toml is the authoritative release version." >&2
+    exit 1
+fi
 step "Packaging Stream Live Translate OBS plugin v$VERSION"
+
+# --- 0. Version consistency --------------------------------------------------
+# Cargo.toml is the single source of truth. plugin/version.h must match it
+# (plugin/CMakeLists.txt aborts otherwise) and the ?v= cache-busting strings
+# must not advertise a different release. Fail before building anything rather
+# than shipping a package whose asset URLs claim another version.
+#   FIX_VERSION_ASSETS=1 bash scripts/package-plugin.sh   -> rewrite ?v= first
+if [ "${FIX_VERSION_ASSETS:-0}" = "1" ]; then
+    bash "$ROOT/scripts/sync-version.sh" --fix
+else
+    bash "$ROOT/scripts/sync-version.sh"
+fi
+step "Version consistency OK (canonical: Cargo.toml v$VERSION)"
 
 case "$(uname -s)" in
     Linux)  OS=linux ;;

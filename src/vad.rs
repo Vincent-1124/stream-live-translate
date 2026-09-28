@@ -65,9 +65,7 @@ impl Vad {
         }
 
         self.silence_ms = 0;
-        self.voiced_ms = self
-            .voiced_ms
-            .saturating_add(frame_ms(pcm, sample_rate));
+        self.voiced_ms = self.voiced_ms.saturating_add(frame_ms(pcm, sample_rate));
         Decision {
             kind: SegmentKind::Speech,
             rms,
